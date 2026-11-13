@@ -133,19 +133,34 @@ __kernel void compute_magnitude_phase(
 
 WINDOWS = {
     "FlatTop": ("flattop", "幅值精度最优 (±0.01 dB)"),
+    "FlatTopM": ("_flattop_m", "改进平顶窗 (低旁瓣)"),
     "Hann": ("hann", "通用频谱分析"),
-    "Blackman-Harris": ("blackmanharris", "极低旁瓣泄漏 (-92 dB)"),
     "Hamming": ("hamming", "窄主瓣频率分辨"),
+    "Blackman": ("blackman", "低旁瓣通用窗"),
+    "Blackman-Harris": ("blackmanharris", "极低旁瓣泄漏 (-92 dB)"),
+    "Kaiser": (("kaiser", 8.6), "可调旁瓣抑制 (-65 dB)"),
+    "Cosine": ("cosine", "半正弦余弦窗"),
+    "Triangular": ("bartlett", "三角 (Bartlett) 窗"),
     "Rectangular": ("boxcar", "无窗函数 (瞬态信号)"),
 }
 
 
 def make_window(name: str, n: int) -> tuple[np.ndarray, float]:
     """Return window array (float32) and coherent gain factor."""
-    scipy_name = WINDOWS.get(name, ("flattop", ""))[0]
-    w = signal.get_window(scipy_name, n, fftbins=True).astype(np.float32)
+    spec = WINDOWS.get(name, ("flattop", ""))[0]
+    if spec == "_flattop_m":
+        k = np.arange(n, dtype=np.float64) * (2.0 * np.pi / max(n, 1))
+        w = (
+            0.21557895
+            - 0.41663158 * np.cos(k)
+            + 0.277263158 * np.cos(2.0 * k)
+            - 0.083578947 * np.cos(3.0 * k)
+            + 0.006947368 * np.cos(4.0 * k)
+        ).astype(np.float32)
+    else:
+        w = signal.get_window(spec, n, fftbins=True).astype(np.float32)
     coherent_gain = float(np.mean(w))
-    return w, coherent_gain
+    return w, max(coherent_gain, 1e-6)
 
 
 def bit_reverse_indices(n: int) -> np.ndarray:
@@ -215,7 +230,13 @@ class GpuFftEngine:
                     vendor = chosen_plat.vendor.strip() if chosen_plat else ""
                     if "Advanced Micro Devices" in vendor:
                         vendor = "AMD"
-                    self.cl_device_label = f"OpenCL GPU · {vendor} {chosen_dev.name}".strip()
+                    elif "NVIDIA" in vendor:
+                        vendor = "NVIDIA"
+                    dname = (chosen_dev.name or "").strip()
+                    if vendor and dname.lower().startswith(vendor.lower()):
+                        self.cl_device_label = f"OpenCL · {dname}"
+                    else:
+                        self.cl_device_label = f"OpenCL · {vendor} {dname}".strip()
                     self.device_name = self.cl_device_label
                     return
             except Exception:
@@ -408,6 +429,98 @@ class GpuFftEngine:
             "metrics": metrics,
         }
 
+    def compute_zoom_fft(
+        self,
+        samples: np.ndarray,
+        fs: float,
+        f_start: float,
+        f_stop: float,
+        m_bins: int = 2048,
+        window_name: str = "FlatTop",
+        remove_dc: bool = True,
+        compute_metrics: bool = True,
+    ) -> dict:
+        """High-resolution narrowband Zoom-FFT (Chirp-Z Transform, FDwfSpectrumTransform equivalent)."""
+        t0 = time.perf_counter()
+        x = np.asarray(samples, dtype=np.float32)
+        if remove_dc and x.size > 0:
+            x = x - np.mean(x, dtype=np.float64)
+        n = int(x.size)
+        win, coh_gain = make_window(window_name, n)
+        xw = (x * win).astype(np.float64)
+
+        f0 = max(0.0, float(f_start))
+        f1 = min(fs * 0.5, max(f0 + 100.0, float(f_stop)))
+        m = int(max(64, m_bins))
+        w_ratio = np.exp(-2j * np.pi * (f1 - f0) / (max(m - 1, 1) * fs))
+        a_start = np.exp(2j * np.pi * f0 / fs)
+        spec = signal.czt(xw, m=m, w=w_ratio, a=a_start)
+
+        norm_factor = 2.0 / (max(n, 1) * max(coh_gain, 1e-6))
+        amp = np.abs(spec).astype(np.float32) * norm_factor
+        mag_vrms = amp * np.float32(0.70710678)
+        mag_dbv = 20.0 * np.log10(np.maximum(mag_vrms, 1e-9))
+        freqs = np.linspace(f0, f1, m, dtype=np.float64)
+        self.last_compute_ms = (time.perf_counter() - t0) * 1000.0
+        metrics = self._compute_spectral_metrics(freqs, mag_dbv, mag_vrms) if compute_metrics else {}
+
+        return {
+            "freqs": freqs,
+            "dbv": mag_dbv,
+            "vrms": mag_vrms,
+            "phase": None,
+            "n_fft": n,
+            "backend": "czt-zoom",
+            "device_name": "Zoom-FFT (CZT)",
+            "compute_ms": self.last_compute_ms,
+            "metrics": metrics,
+        }
+
+    @staticmethod
+    def compute_goertzel(
+        samples: np.ndarray,
+        fs: float,
+        target_freq_hz: float,
+        window_name: str = "FlatTop",
+    ) -> dict:
+        """Exact single-tone amplitude & phase measurement (FDwfSpectrumGoertzel equivalent)."""
+        x = np.asarray(samples, dtype=np.float64)
+        if x.size == 0 or fs <= 0.0:
+            return {"freq_hz": target_freq_hz, "vrms": 0.0, "dbv": -120.0, "phase_deg": 0.0}
+        x = x - np.mean(x)
+        n = x.size
+        win, coh_gain = make_window(window_name, n)
+        xw = x * win.astype(np.float64)
+        t_idx = np.arange(n, dtype=np.float64)
+        phase_vec = np.exp(-2j * np.pi * (target_freq_hz / fs) * t_idx)
+        z = np.dot(xw, phase_vec)
+        amp = (2.0 / (n * max(coh_gain, 1e-6))) * abs(z)
+        vrms = float(amp * 0.7071067811865475)
+        dbv = float(20.0 * math.log10(max(vrms, 1e-9)))
+        phase_deg = float(math.degrees(np.angle(z)))
+        return {
+            "freq_hz": float(target_freq_hz),
+            "vrms": vrms,
+            "dbv": dbv,
+            "phase_deg": phase_deg,
+        }
+
+    @staticmethod
+    def _interp_peak(freqs: np.ndarray, dbv: np.ndarray, idx: int) -> tuple[float, float]:
+        """Parabolic 3-bin interpolation for sub-bin frequency & amplitude accuracy."""
+        if idx <= 0 or idx >= dbv.size - 1:
+            return float(freqs[idx]), float(dbv[idx])
+        yl = float(dbv[idx - 1])
+        yc = float(dbv[idx])
+        yr = float(dbv[idx + 1])
+        denom = yl - 2.0 * yc + yr
+        if abs(denom) < 1e-9:
+            return float(freqs[idx]), yc
+        delta = max(-0.5, min(0.5, 0.5 * (yl - yr) / denom))
+        df = float(freqs[1] - freqs[0]) if freqs.size > 1 else 0.0
+        f_est = float(freqs[idx]) + delta * df
+        return f_est, yc
+
     @staticmethod
     def _compute_spectral_metrics(freqs: np.ndarray, dbv: np.ndarray, vrms: np.ndarray) -> dict:
         n = freqs.size
@@ -415,8 +528,7 @@ class GpuFftEngine:
             return {}
         # Fast vectorized peak search without scipy.signal.find_peaks overhead
         fund_idx = 3 + int(np.argmax(vrms[3:]))
-        fund_freq = float(freqs[fund_idx])
-        fund_dbv = float(dbv[fund_idx])
+        fund_freq, fund_dbv = GpuFftEngine._interp_peak(freqs, dbv, fund_idx)
         fund_vrms = float(vrms[fund_idx])
 
         # Parabolic interpolation around peak for sub-bin frequency estimation
@@ -458,17 +570,20 @@ class GpuFftEngine:
         snr_db = 10.0 * math.log10(fund_power / noise_power)
 
         # Fast local maxima detection using neighbor comparison (10x faster than scipy.signal.find_peaks)
+        noise_med = float(np.median(dbv[3:])) if n > 8 else -90.0
+        peak_thresh = max(noise_med + 12.0, -82.0)
         mid = dbv[3:-1]
-        is_local_max = (mid > dbv[2:-2]) & (mid >= dbv[4:]) & (mid > -68.0)
+        is_local_max = (mid > dbv[2:-2]) & (mid >= dbv[4:]) & (mid > peak_thresh)
         cand_idx = np.nonzero(is_local_max)[0] + 3
         if cand_idx.size > 0:
             order = np.argsort(dbv[cand_idx])[::-1]
             selected = []
-            min_sep = max(4, n // 150)
+            min_sep = max(4, min(12, n // 1500))
             for idx in cand_idx[order]:
                 if all(abs(int(idx) - s[0]) >= min_sep for s in selected):
-                    selected.append((int(idx), float(freqs[idx]), float(dbv[idx])))
-                    if len(selected) >= 5:
+                    pf, pd = GpuFftEngine._interp_peak(freqs, dbv, int(idx))
+                    selected.append((int(idx), pf, pd))
+                    if len(selected) >= 12:
                         break
             top_peaks = [(f, d) for _, f, d in selected]
             max_spur_dbv = selected[1][2] if len(selected) > 1 else float(np.max(dbv[3:lo0]) if lo0 > 3 else -100.0)

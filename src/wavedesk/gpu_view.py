@@ -2,7 +2,7 @@
 
 Upgrades over SpectraDesk's `gpu_curve.py`:
 1. True GPU SDF Thick-Segment Anti-Aliasing (instanced/expanded triangle strip in vertex+fragment shader,
-   avoiding OpenGL core profile's 1px `glLineWidth` limit and 3-pass CPU redraw loops).
+   avoiding OpenGL core profile's 1px `glLineWidth` limit and 3-pass CPU redraw loops) with twist-free vertex normals.
 2. True Digital Phosphor Oscilloscope (DPO) persistence with thermal/intensity color grading
    (accumulating hit density in an offscreen FBO and mapping intensity through a GPU thermal LUT).
 3. Hardware Peak-Detect Min/Max Envelope decimation when sample count >> screen width, ensuring
@@ -80,11 +80,11 @@ out vec4 fragColor;
 void main() {
     float d = abs(v_edge);
     // Smooth SDF core + subtle outer bloom
-    float core = smoothstep(0.65, 0.0, d);
+    float core = smoothstep(0.75, 0.0, d);
     if (u_glow_mode == 1) {
-        float halo = exp(-5.5 * d * d);
-        vec3 col = mix(u_color.rgb, vec3(1.0, 1.0, 1.0), core * 0.35);
-        float alpha = u_color.a * clamp(core * 0.90 + halo * 0.28, 0.0, 1.0);
+        float halo = exp(-6.0 * d * d);
+        vec3 col = mix(u_color.rgb, vec3(1.0, 1.0, 1.0), core * 0.25);
+        float alpha = u_color.a * clamp(core * 0.94 + halo * 0.22, 0.0, 1.0);
         fragColor = vec4(col, alpha);
     } else {
         fragColor = vec4(u_color.rgb, u_color.a * core);
@@ -115,11 +115,11 @@ vec3 dpo_thermal(float intensity, vec3 base) {
     float t = clamp(intensity, 0.0, 1.0);
     vec3 low = base * 0.65;
     vec3 mid = base;
-    vec3 high = mix(base, vec3(1.0, 1.0, 1.0), 0.55);
-    if (t < 0.55) {
-        return mix(low, mid, t / 0.55);
+    vec3 high = mix(base, vec3(1.0, 1.0, 1.0), 0.45);
+    if (t < 0.60) {
+        return mix(low, mid, t / 0.60);
     }
-    return mix(mid, high, (t - 0.55) / 0.45);
+    return mix(mid, high, (t - 0.60) / 0.40);
 }
 
 void main() {
@@ -130,7 +130,7 @@ void main() {
             fragColor = vec4(0.0);
         } else {
             vec3 graded = dpo_thermal(lum, u_base_color);
-            float out_a = clamp(lum * 1.15, 0.0, 0.95);
+            float out_a = clamp(lum * 1.10, 0.0, 0.95);
             fragColor = vec4(graded * out_a, out_a);
         }
     } else {
@@ -188,7 +188,7 @@ def build_sdf_ribbon_vertices(
     viewport_px: tuple[float, float],
     max_segments: int = 2048,
 ) -> np.ndarray:
-    """Build GPU triangle-strip ribbon with screen-space normals for SDF anti-aliasing & peak envelope."""
+    """Build twist-free GPU triangle-strip ribbon with screen-space normals for SDF anti-aliasing & peak envelope."""
     n = x.size
     if n < 2:
         return np.empty((0, 5), dtype=np.float32)
@@ -240,17 +240,36 @@ def build_sdf_ribbon_vertices(
     scale_x = np.float32(max(viewport_px[0], 1.0)) / span_x
     scale_y = np.float32(max(viewport_px[1], 1.0)) / span_y
 
-    # Fast finite-difference tangent in float32 (5x faster than np.gradient)
-    dx_px = np.empty(n, dtype=np.float32)
-    dy_px = np.empty(n, dtype=np.float32)
-    dx_px[:-1] = (x[1:] - x[:-1]) * scale_x
-    dx_px[-1] = dx_px[-2]
-    dy_px[:-1] = (y[1:] - y[:-1]) * scale_y
-    dy_px[-1] = dy_px[-2]
+    # Segment vectors in screen pixels
+    dx_seg = (x[1:] - x[:-1]) * scale_x
+    dy_seg = (y[1:] - y[:-1]) * scale_y
+    seg_len = np.maximum(np.hypot(dx_seg, dy_seg), np.float32(1e-6))
 
-    inv_len = np.float32(1.0) / np.maximum(np.hypot(dx_px, dy_px), np.float32(1e-6))
-    nx = -dy_px * inv_len
-    ny = dx_px * inv_len
+    # For dense/sub-pixel horizontal steps (dx_seg < 2.5 px), keep nx non-negative so vertical oscillations
+    # and min/max envelopes never flip normal orientation (-1 -> +1) and twist the triangle strip into a bowtie!
+    nx_seg = np.where(dx_seg < np.float32(2.5), np.abs(dy_seg) / seg_len, -dy_seg / seg_len)
+    ny_seg = dx_seg / seg_len
+
+    # Smooth vertex normals by averaging incoming and outgoing segment normals
+    nx = np.empty(n, dtype=np.float32)
+    ny = np.empty(n, dtype=np.float32)
+    nx[0], ny[0] = nx_seg[0], ny_seg[0]
+    nx[-1], ny[-1] = nx_seg[-1], ny_seg[-1]
+    if n > 2:
+        nx[1:-1] = np.float32(0.5) * (nx_seg[:-1] + nx_seg[1:])
+        ny[1:-1] = np.float32(0.5) * (ny_seg[:-1] + ny_seg[1:])
+
+    v_len = np.hypot(nx, ny)
+    small = v_len < np.float32(0.35)
+    if np.any(small):
+        idx_s = np.minimum(np.nonzero(small)[0], n - 2)
+        nx[small] = np.abs(nx_seg[idx_s])
+        ny[small] = np.maximum(ny_seg[idx_s], np.float32(0.25))
+        v_len = np.hypot(nx, ny)
+
+    inv_vlen = np.float32(1.0) / np.maximum(v_len, np.float32(1e-6))
+    nx *= inv_vlen
+    ny *= inv_vlen
 
     # Expand each point into 2 vertices (+normal with edge=+1, -normal with edge=-1)
     verts = np.empty((n * 2, 5), dtype=np.float32)
@@ -346,14 +365,14 @@ class DpoShaderState(OpenGLState):
 class GpuWaveformCurve(pg.PlotCurveItem):
     """High-performance OpenGL SDF Anti-Aliased & Digital Phosphor (DPO) Waveform Curve."""
 
-    def __init__(self, color: str = "#00f2fe", width: float = 2.2, dpo_enabled: bool = True, **kwargs):
+    def __init__(self, color: str = "#00f2fe", width: float = 2.2, dpo_enabled: bool = False, **kwargs):
         pen = pg.mkPen(color, width=width)
         super().__init__(pen=pen, **kwargs)
         self.curve = self
         self.base_color = QtGui.QColor(color)
         self.line_width = float(width)
         self.dpo_enabled = dpo_enabled
-        self.dpo_decay_tau = 0.45  # Persistence decay constant in seconds
+        self.dpo_decay_tau = 0.22  # Crisp persistence decay constant in seconds
         self.glow_enabled = True
         self.serial = 0
         self.last_error = None
@@ -363,20 +382,35 @@ class GpuWaveformCurve(pg.PlotCurveItem):
         self.base_color = QtGui.QColor(color)
         self.setPen(pg.mkPen(self.base_color, width=self.line_width))
 
-    def set_dpo(self, enabled: bool, decay_tau: float = 0.45):
+    def set_dpo(self, enabled: bool, decay_tau: float = 0.22):
         self.dpo_enabled = bool(enabled)
-        self.dpo_decay_tau = max(0.08, float(decay_tau))
+        self.dpo_decay_tau = max(0.06, float(decay_tau))
         self.update()
 
     def set_fast_data(self, x: np.ndarray, y: np.ndarray):
-        """Zero-overhead waveform buffer update for OpenGL streaming (skips QPainterPath & dataBounds)."""
+        """Low-overhead waveform buffer update for OpenGL/Software streaming with accurate dynamic bounds."""
         self.xData = np.asarray(x, dtype=np.float32)
         self.yData = np.asarray(y, dtype=np.float32)
         self.path = None
+        self.fillPath = None
+        self._fillPathList = None
+        self._mouseShape = None
+        self._lineSegmentsRendered = False
+        self._boundsCache = [None, None]
         self.serial = getattr(self, "serial", 0) + 1
-        if self._fast_bounds is None and self.xData.size >= 2:
+        if self.xData.size >= 2:
             x0, x1 = float(self.xData[0]), float(self.xData[-1])
-            self._fast_bounds = QtCore.QRectF(min(x0, x1), -50.0, max(abs(x1 - x0), 1e-9), 100.0)
+            ymin = float(np.min(self.yData))
+            ymax = float(np.max(self.yData))
+            if not np.isfinite(ymin) or not np.isfinite(ymax):
+                ymin, ymax = -10.0, 10.0
+            pad_y = max(abs(ymax - ymin) * 0.15, 0.5)
+            self._fast_bounds = QtCore.QRectF(
+                min(x0, x1),
+                ymin - pad_y,
+                max(abs(x1 - x0), 1e-9),
+                max((ymax - ymin) + 2.0 * pad_y, 1.0),
+            )
         self.update()
 
     def boundingRect(self) -> QtCore.QRectF:
@@ -460,7 +494,6 @@ class GpuWaveformCurve(pg.PlotCurveItem):
 
         vr = view.viewRange()
         vb_rect = view.sceneBoundingRect()
-        # Use logical scene dimensions for normal aspect ratio, and logical widget rect for u_viewport
         vw_logical = float(max(16.0, vb_rect.width()))
         vh_logical = float(max(16.0, vb_rect.height()))
 
@@ -472,7 +505,7 @@ class GpuWaveformCurve(pg.PlotCurveItem):
             y_rel,
             ((vr[0][0] - xc, vr[0][1] - xc), (vr[1][0] - yc, vr[1][1] - yc)),
             (vw_logical, vh_logical),
-            max_segments=max(1024, int(vw_logical * 1.25)),
+            max_segments=max(1024, int(vw_logical * 1.5)),
         )
         if verts.shape[0] < 4:
             prog.release()
@@ -486,7 +519,7 @@ class GpuWaveformCurve(pg.PlotCurveItem):
         h_logical = float(max(1.0, widget.height()))
         OpenGLHelpers.setUniformValue(prog, "u_mvp", mvp)
         OpenGLHelpers.setUniformValue(prog, "u_viewport", QtGui.QVector2D(w_logical, h_logical))
-        half_w = max(1.5, self.line_width * (1.8 if self.glow_enabled else 1.1))
+        half_w = max(1.3, self.line_width * (1.45 if self.glow_enabled else 1.05))
         gl.glUniform1f(prog.uniformLocation("u_half_width"), float(half_w))
         c = self.base_color
         OpenGLHelpers.setUniformValue(
@@ -580,7 +613,7 @@ class GpuWaveformCurve(pg.PlotCurveItem):
             # Accumulate new trace into DPO FBO with additive blending
             gl.glEnable(GL.GL_BLEND)
             gl.glBlendFunc(GL.GL_SRC_ALPHA, 1)
-            self._upload_and_draw_sdf_line(widget, view, size, alpha_scale=0.72)
+            self._upload_and_draw_sdf_line(widget, view, size, alpha_scale=0.55)
             gl.glDisable(GL.GL_BLEND)
 
             state.targets = [target, previous]

@@ -25,7 +25,13 @@ class InstrumentWorker(QObject):
         self.fft_window = "FlatTop"
         self.fft_avg_count = 1
         self.fft_n_pad = 0
+        self.fft_zoom_enabled = False
+        self.fft_zoom_stop_hz = 5_000_000.0
+        self.fft_trace_mode = "live"  # "live" | "max_hold" | "min_hold"
+        self.fft_goertzel_enabled = False
+        self.fft_goertzel_freq_hz = 200_000.0
         self._fft_accum: dict[str, np.ndarray] = {}
+        self._fft_hold: dict[str, np.ndarray] = {}
         self._last_metrics: dict[str, dict] = {}
         self._frame_seq = 0
         self.timer: QTimer | None = None
@@ -35,7 +41,7 @@ class InstrumentWorker(QObject):
     def _ensure_timer(self):
         if self.timer is None:
             self.timer = QTimer(self)
-            self.timer.setInterval(33)  # ~30 Hz ultra-efficient smooth oscilloscope refresh
+            self.timer.setInterval(50)  # ~20 Hz smooth, low-CPU oscilloscope refresh
             self.timer.timeout.connect(self._poll_frame)
 
     @Slot()
@@ -59,7 +65,7 @@ class InstrumentWorker(QObject):
     @Slot()
     def disconnect_device(self):
         self.stop_acquisition()
-        self.driver.close()
+        self.driver.close(reset_awg=False)
         self.connection_changed.emit(False)
         self.status_changed.emit("已断开连接")
 
@@ -83,7 +89,7 @@ class InstrumentWorker(QObject):
         self.running = True
         self.driver._scope_dirty = True
         self.timer.start()
-        self.status_changed.emit("采集中 · 实时流")
+        self.status_changed.emit("采集中 · 实时稳相流")
 
     @Slot()
     def stop_acquisition(self):
@@ -118,8 +124,24 @@ class InstrumentWorker(QObject):
     def update_awg_config(self, channel_idx: int, cfg: AwgChannelConfig):
         try:
             self.driver.configure_awg(channel_idx, cfg)
-            state_txt = f"{cfg.function} {cfg.frequency_hz/1e3:.3g} kHz, {cfg.amplitude_v:.2f} V" if cfg.enabled else "已关闭"
+            state_txt = f"{cfg.function} {cfg.frequency_hz/1e3:.4g} kHz, {cfg.amplitude_v:.2f} V" if cfg.enabled else "已关闭"
             self.status_changed.emit(f"W{channel_idx + 1} 已更新 · {state_txt}")
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+    @Slot()
+    def trigger_pc(self):
+        try:
+            self.driver.trigger_pc()
+            self.status_changed.emit("已发送 PC 手动触发脉冲")
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+    @Slot()
+    def force_scope_trigger(self):
+        try:
+            self.driver.force_scope_trigger()
+            self.status_changed.emit("已发送示波器强制触发")
         except Exception as exc:
             self.error_occurred.emit(str(exc))
 
@@ -139,6 +161,25 @@ class InstrumentWorker(QObject):
         if "n_fft" in settings:
             self.fft_n_pad = int(settings["n_fft"])
             self._fft_accum.clear()
+            self._fft_hold.clear()
+        if "zoom_enabled" in settings:
+            self.fft_zoom_enabled = bool(settings["zoom_enabled"])
+            self._fft_accum.clear()
+            self._fft_hold.clear()
+        if "zoom_stop_hz" in settings:
+            self.fft_zoom_stop_hz = float(settings["zoom_stop_hz"])
+            if self.fft_zoom_enabled:
+                self._fft_accum.clear()
+                self._fft_hold.clear()
+        if "trace_mode" in settings:
+            self.fft_trace_mode = str(settings["trace_mode"])
+            self._fft_hold.clear()
+        if "goertzel_enabled" in settings:
+            self.fft_goertzel_enabled = bool(settings["goertzel_enabled"])
+        if "goertzel_freq_hz" in settings:
+            self.fft_goertzel_freq_hz = float(settings["goertzel_freq_hz"])
+        if settings.get("clear_hold"):
+            self._fft_hold.clear()
 
     @Slot()
     def _poll_frame(self, single_shot: bool = False):
@@ -161,12 +202,23 @@ class InstrumentWorker(QObject):
             t = raw["t"]
             ch1 = raw["ch1"]
             ch2 = raw["ch2"]
+            ch1_env = raw.get("ch1_env")
+            ch2_env = raw.get("ch2_env")
+            if_freq_hz = raw.get("if_freq_hz", 0.0)
             self._frame_seq += 1
-            do_telemetry = single_shot or (self._frame_seq % 4 == 1)
+            do_telemetry = single_shot or (self._frame_seq % 3 == 1)
 
             if do_telemetry:
-                m1 = measure_channel(t, ch1, fs) if self.driver.scope_cfg.channels[0].enabled else {}
-                m2 = measure_channel(t, ch2, fs) if self.driver.scope_cfg.channels[1].enabled else {}
+                m1 = (
+                    measure_channel(t, ch1, fs, env=ch1_env, if_freq_hz=if_freq_hz if ch1_env is not None else 0.0)
+                    if self.driver.scope_cfg.channels[0].enabled
+                    else {}
+                )
+                m2 = (
+                    measure_channel(t, ch2, fs, env=ch2_env, if_freq_hz=if_freq_hz if ch2_env is not None else 0.0)
+                    if self.driver.scope_cfg.channels[1].enabled
+                    else {}
+                )
                 self._last_meas = {"ch1": m1, "ch2": m2}
             else:
                 self._last_meas = getattr(self, "_last_meas", {"ch1": {}, "ch2": {}})
@@ -176,13 +228,24 @@ class InstrumentWorker(QObject):
                 pad_n = self.fft_n_pad if self.fft_n_pad > 0 else None
                 for ch_name, idx, arr in [("ch1", 0, ch1), ("ch2", 1, ch2)]:
                     if self.driver.scope_cfg.channels[idx].enabled:
-                        res = self.fft_engine.compute(
-                            arr,
-                            fs,
-                            window_name=self.fft_window,
-                            pad_to=pad_n,
-                            compute_metrics=do_telemetry,
-                        )
+                        if self.fft_zoom_enabled and self.fft_zoom_stop_hz > 100.0:
+                            res = self.fft_engine.compute_zoom_fft(
+                                arr,
+                                fs,
+                                f_start=0.0,
+                                f_stop=min(fs * 0.5, self.fft_zoom_stop_hz),
+                                m_bins=2048,
+                                window_name=self.fft_window,
+                                compute_metrics=do_telemetry,
+                            )
+                        else:
+                            res = self.fft_engine.compute(
+                                arr,
+                                fs,
+                                window_name=self.fft_window,
+                                pad_to=pad_n,
+                                compute_metrics=do_telemetry,
+                            )
                         if res:
                             if not do_telemetry and ch_name in self._last_metrics:
                                 res["metrics"] = self._last_metrics[ch_name]
@@ -196,6 +259,22 @@ class InstrumentWorker(QObject):
                                 else:
                                     self._fft_accum[ch_name] = (np.float32(1.0) - alpha) * prev + alpha * res["dbv"]
                                 res["dbv"] = self._fft_accum[ch_name]
+                            if self.fft_trace_mode in ("max_hold", "min_hold"):
+                                prev_h = self._fft_hold.get(ch_name)
+                                if prev_h is None or prev_h.shape != res["dbv"].shape:
+                                    self._fft_hold[ch_name] = res["dbv"].copy()
+                                elif self.fft_trace_mode == "max_hold":
+                                    np.maximum(prev_h, res["dbv"], out=prev_h)
+                                else:
+                                    np.minimum(prev_h, res["dbv"], out=prev_h)
+                                res["dbv"] = self._fft_hold[ch_name]
+                            if self.fft_goertzel_enabled and do_telemetry:
+                                res["goertzel"] = self.fft_engine.compute_goertzel(
+                                    arr,
+                                    fs,
+                                    self.fft_goertzel_freq_hz,
+                                    window_name=self.fft_window,
+                                )
                         fft_res[ch_name] = res
 
             raw["meas"] = self._last_meas
