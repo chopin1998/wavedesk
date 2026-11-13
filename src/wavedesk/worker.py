@@ -65,7 +65,7 @@ class InstrumentWorker(QObject):
     @Slot()
     def disconnect_device(self):
         self.stop_acquisition()
-        self.driver.close(reset_awg=False)
+        self.driver.close(reset_awg=True)
         self.connection_changed.emit(False)
         self.status_changed.emit("已断开连接")
 
@@ -236,7 +236,7 @@ class InstrumentWorker(QObject):
                                 f_stop=min(fs * 0.5, self.fft_zoom_stop_hz),
                                 m_bins=2048,
                                 window_name=self.fft_window,
-                                compute_metrics=do_telemetry,
+                                compute_metrics=False,
                             )
                         else:
                             res = self.fft_engine.compute(
@@ -244,13 +244,9 @@ class InstrumentWorker(QObject):
                                 fs,
                                 window_name=self.fft_window,
                                 pad_to=pad_n,
-                                compute_metrics=do_telemetry,
+                                compute_metrics=False,
                             )
                         if res:
-                            if not do_telemetry and ch_name in self._last_metrics:
-                                res["metrics"] = self._last_metrics[ch_name]
-                            else:
-                                self._last_metrics[ch_name] = res.get("metrics", {})
                             if self.fft_avg_count > 1:
                                 alpha = np.float32(1.0 / float(self.fft_avg_count))
                                 prev = self._fft_accum.get(ch_name)
@@ -268,6 +264,10 @@ class InstrumentWorker(QObject):
                                 else:
                                     np.minimum(prev_h, res["dbv"], out=prev_h)
                                 res["dbv"] = self._fft_hold[ch_name]
+                            # Compute peak & spectral metrics on the exact displayed (averaged/held) dbv array
+                            vrms_disp = np.power(10.0, res["dbv"] / 20.0).astype(np.float32)
+                            res["metrics"] = self.fft_engine._compute_spectral_metrics(res["freqs"], res["dbv"], vrms_disp)
+                            self._last_metrics[ch_name] = res["metrics"]
                             if self.fft_goertzel_enabled and do_telemetry:
                                 res["goertzel"] = self.fft_engine.compute_goertzel(
                                     arr,

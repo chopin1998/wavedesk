@@ -571,25 +571,32 @@ class GpuFftEngine:
 
         # Fast local maxima detection using neighbor comparison (10x faster than scipy.signal.find_peaks)
         noise_med = float(np.median(dbv[3:])) if n > 8 else -90.0
-        peak_thresh = max(noise_med + 12.0, -82.0)
+        peak_thresh = max(noise_med + 15.0, -82.0)
         mid = dbv[3:-1]
         is_local_max = (mid > dbv[2:-2]) & (mid >= dbv[4:]) & (mid > peak_thresh)
         cand_idx = np.nonzero(is_local_max)[0] + 3
+        top_peaks: list[tuple[float, float]] = []
+        max_spur_dbv = -100.0
         if cand_idx.size > 0:
             order = np.argsort(dbv[cand_idx])[::-1]
             selected = []
             min_sep = max(4, min(12, n // 1500))
             for idx in cand_idx[order]:
-                if all(abs(int(idx) - s[0]) >= min_sep for s in selected):
-                    pf, pd = GpuFftEngine._interp_peak(freqs, dbv, int(idx))
-                    selected.append((int(idx), pf, pd))
-                    if len(selected) >= 12:
-                        break
-            top_peaks = [(f, d) for _, f, d in selected]
-            max_spur_dbv = selected[1][2] if len(selected) > 1 else float(np.max(dbv[3:lo0]) if lo0 > 3 else -100.0)
-        else:
-            top_peaks = [(fund_freq, fund_dbv)]
-            max_spur_dbv = -100.0
+                i_int = int(idx)
+                if not all(abs(i_int - s[0]) >= min_sep for s in selected):
+                    continue
+                lo_loc = max(3, i_int - 24)
+                hi_loc = min(n, i_int + 25)
+                local_med = float(np.median(dbv[lo_loc:hi_loc]))
+                if float(dbv[i_int]) < local_med + 14.0:
+                    continue
+                pf, pd = GpuFftEngine._interp_peak(freqs, dbv, i_int)
+                selected.append((i_int, pf, pd))
+                if len(selected) >= 8:
+                    break
+            if selected:
+                top_peaks = [(f, d) for _, f, d in selected]
+                max_spur_dbv = selected[1][2] if len(selected) > 1 else float(np.max(dbv[3:lo0]) if lo0 > 3 else -100.0)
 
         sfdr_db = float(fund_dbv - max_spur_dbv)
 

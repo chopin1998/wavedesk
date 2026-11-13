@@ -1,7 +1,9 @@
 """WaveDesk: Next-Gen GPU-Accelerated AD3 Oscilloscope, Spectrum Analyzer & AWG Workbench."""
 from __future__ import annotations
 import argparse
+from pathlib import Path
 import sys
+import wave
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets as W
@@ -13,6 +15,7 @@ from .driver import (
     AwgChannelConfig,
     ChannelConfig,
     HW_FILTERS,
+    SSB_MODES,
     ScopeConfig,
     TRIGGER_LENGTH_CONDS,
     TRIGGER_TYPES,
@@ -794,6 +797,127 @@ class OverviewPositionBar(W.QWidget):
         ev.accept()
 
 
+class WaterfallOverlay(W.QFrame):
+    """In-app draggable & resizable floating spectrogram waterfall (no OS window)."""
+
+    closed = QtCore.Signal()
+
+    def __init__(self, parent: W.QWidget, use_opengl: bool = False, rows: int = 120, cols: int = 512):
+        super().__init__(parent)
+        self._rows = rows
+        self._cols = cols
+        self._buf = np.full((rows, cols), -95.0, dtype=np.float32)
+        self._drag_origin: QtCore.QPoint | None = None
+        self.setObjectName("card")
+        self.setStyleSheet(
+            "WaterfallOverlay { background-color: rgba(13, 19, 28, 240); border: 1px solid #355070; border-radius: 8px; }"
+        )
+        self.resize(620, 250)
+        self.setMinimumSize(360, 170)
+
+        vbox = W.QVBoxLayout(self)
+        vbox.setContentsMargins(6, 4, 6, 4)
+        vbox.setSpacing(4)
+
+        bar = W.QHBoxLayout()
+        bar.setSpacing(4)
+        self._title = W.QLabel("🌊 瀑布图")
+        self._title.setStyleSheet("color: #7cc4ff; font-weight: 700; font-size: 9pt;")
+        self._title.setCursor(QtCore.Qt.CursorShape.SizeAllCursor)
+        btn_clr = W.QPushButton("清除")
+        btn_clr.setObjectName("miniBtn")
+        btn_clr.setStyleSheet("font-size: 8.5pt; padding: 1px 6px;")
+        btn_clr.clicked.connect(self.clear)
+        btn_cls = W.QPushButton("✕")
+        btn_cls.setObjectName("removeBtn")
+        btn_cls.setStyleSheet("font-size: 8.5pt; padding: 1px 5px;")
+        btn_cls.clicked.connect(self._on_close)
+        bar.addWidget(self._title, 1)
+        bar.addWidget(btn_clr)
+        bar.addWidget(btn_cls)
+        vbox.addLayout(bar)
+
+        self.plot = FastPlotWidget("", "", "Hz", "", "", use_opengl=False)
+        self.plot.showGrid(x=True, y=False, alpha=0.18)
+        tick_font = QtGui.QFont()
+        tick_font.setPointSize(8)
+        for ax_name in ("bottom", "left"):
+            ax = self.plot.getPlotItem().getAxis(ax_name)
+            ax.setStyle(tickFont=tick_font)
+        self.plot.getPlotItem().setLabel("left", None)
+        self.plot.getPlotItem().setLabel("bottom", None)
+        self.img = pg.ImageItem(axisOrder="row-major")
+        # Dark -> Blue -> Cyan -> Yellow -> Red colormap
+        pos = np.array([0.0, 0.25, 0.55, 0.80, 1.0])
+        cols_rgba = np.array(
+            [
+                [8, 12, 20, 255],
+                [18, 65, 130, 255],
+                [0, 215, 255, 255],
+                [255, 225, 30, 255],
+                [255, 55, 65, 255],
+            ],
+            dtype=np.ubyte,
+        )
+        cmap = pg.ColorMap(pos, cols_rgba)
+        self.img.setLookupTable(cmap.getLookupTable(0.0, 1.0, 256))
+        self.plot.addItem(self.img)
+        vbox.addWidget(self.plot, 1)
+
+        foot = W.QHBoxLayout()
+        foot.setContentsMargins(0, 0, 0, 0)
+        grip = W.QSizeGrip(self)
+        foot.addStretch(1)
+        foot.addWidget(grip, 0, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignBottom)
+        vbox.addLayout(foot)
+
+    def _on_close(self):
+        self.hide()
+        self.closed.emit()
+
+    def clear(self):
+        self._buf.fill(-95.0)
+        self.img.setImage(self._buf, autoLevels=False, levels=(-95.0, -5.0))
+
+    def push_spectrum(self, freqs: np.ndarray, dbv: np.ndarray, fx0: float, fx1: float):
+        if not self.isVisible() or freqs.size < 2 or fx1 <= fx0:
+            return
+        grid_f = np.linspace(fx0, fx1, self._cols, dtype=np.float64)
+        row = np.interp(grid_f, freqs, dbv).astype(np.float32)
+        self._buf = np.roll(self._buf, -1, axis=0)
+        self._buf[-1, :] = row
+        lo = float(np.percentile(self._buf, 5))
+        hi = max(lo + 20.0, float(np.max(self._buf)))
+        self.img.setImage(self._buf, autoLevels=False, levels=(lo, hi))
+        self.img.setRect(QtCore.QRectF(fx0, -self._rows, fx1 - fx0, self._rows))
+        self.plot.setXRange(fx0, fx1, padding=0.0)
+        self.plot.setYRange(-self._rows, 0.0, padding=0.0)
+
+    def mousePressEvent(self, ev: QtGui.QMouseEvent):
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton and ev.position().y() <= 34:
+            self._drag_origin = ev.globalPosition().toPoint() - self.pos()
+            self.raise_()
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev: QtGui.QMouseEvent):
+        if self._drag_origin is not None:
+            new_pos = ev.globalPosition().toPoint() - self._drag_origin
+            if self.parentWidget() is not None:
+                pw, ph = self.parentWidget().width(), self.parentWidget().height()
+                new_pos.setX(max(0, min(pw - self.width(), new_pos.x())))
+                new_pos.setY(max(0, min(ph - self.height(), new_pos.y())))
+            self.move(new_pos)
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev: QtGui.QMouseEvent):
+        self._drag_origin = None
+        super().mouseReleaseEvent(ev)
+
+
 class MainWindow(W.QMainWindow):
     req_connect = QtCore.Signal()
     req_disconnect = QtCore.Signal()
@@ -886,7 +1010,21 @@ class MainWindow(W.QMainWindow):
         self.btn_stop.clicked.connect(self.req_stop.emit)
         top_layout.addWidget(self.btn_stop)
 
+        self.btn_top_waterfall = W.QPushButton("🌊 瀑布图")
+        self.btn_top_waterfall.setCheckable(True)
+        self.btn_top_waterfall.setToolTip("打开/关闭应用内悬浮瀑布图 (非系统窗口)")
+        self.btn_top_waterfall.toggled.connect(self._toggle_waterfall)
+        top_layout.addWidget(self.btn_top_waterfall)
+
         top_layout.addStretch(1)
+
+        self.lbl_status = W.QLabel("就绪")
+        self.lbl_status.setObjectName("muted")
+        top_layout.addWidget(self.lbl_status)
+
+        self.lbl_fps = W.QLabel("FPS: -- | FFT: -- ms")
+        self.lbl_fps.setObjectName("muted")
+        top_layout.addWidget(self.lbl_fps)
 
         self.lbl_gpu_badge = W.QLabel("GPU FFT: 检测中…")
         self.lbl_gpu_badge.setObjectName("gpuBadge")
@@ -1100,6 +1238,11 @@ class MainWindow(W.QMainWindow):
         self.card_awg = self._build_awg_card()
         self.card_misc = self._build_misc_card()
 
+        self.waterfall_overlay = WaterfallOverlay(root, use_opengl=self.use_opengl)
+        self.waterfall_overlay.move(28, 86)
+        self.waterfall_overlay.hide()
+        self.waterfall_overlay.closed.connect(self._on_waterfall_closed)
+
         rack_layout.addWidget(self.card_tb)
         rack_layout.addWidget(self.card_trig)
         rack_layout.addWidget(self.card_ch)
@@ -1117,14 +1260,6 @@ class MainWindow(W.QMainWindow):
         self.body_split.setStretchFactor(0, 1)
         self.body_split.setStretchFactor(1, 0)
         self.body_split.setSizes([max(760, self.width() - rack_w - 24), rack_w])
-
-        # Status Bar
-        self.status_bar = W.QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.lbl_status = W.QLabel("就绪")
-        self.lbl_fps = W.QLabel("FPS: -- | FFT: -- ms")
-        self.status_bar.addWidget(self.lbl_status, 1)
-        self.status_bar.addPermanentWidget(self.lbl_fps)
 
     def _build_timebase_card(self) -> CollapsibleCard:
         card = CollapsibleCard("⏱ 水平时基与采集 (Timebase)", expanded=True)
@@ -1530,9 +1665,14 @@ class MainWindow(W.QMainWindow):
         self.btn_fft_clear_hold = W.QPushButton("清除")
         self.btn_fft_clear_hold.setToolTip("清除峰值/谷值保持曲线")
         self.btn_fft_clear_hold.clicked.connect(self._clear_fft_hold)
+        self.btn_waterfall = W.QPushButton("🌊 瀑布图")
+        self.btn_waterfall.setCheckable(True)
+        self.btn_waterfall.setToolTip("打开/关闭应用内悬浮瀑布图 (非系统窗口)")
+        self.btn_waterfall.toggled.connect(self._toggle_waterfall)
         unit_tr_row.addWidget(self.cmb_fft_unit)
         unit_tr_row.addWidget(self.cmb_fft_trace, 1)
         unit_tr_row.addWidget(self.btn_fft_clear_hold)
+        unit_tr_row.addWidget(self.btn_waterfall)
         grid.addLayout(unit_tr_row, 4, 1)
 
         self.chk_fft_zoom = W.QCheckBox("🔍 Zoom-FFT 窄带细化 (CZT 2048pt @ 当前视野)")
@@ -1582,6 +1722,8 @@ class MainWindow(W.QMainWindow):
         self.awg_widgets = []
         self.awg_adv_widgets = []
         self.awg_custom_samples: list[list[float] | None] = [None, None]
+        self.awg_am_wav: list[tuple[list[float], float, str] | None] = [None, None]
+        self.awg_fm_wav: list[tuple[list[float], float, str] | None] = [None, None]
         self.awg_subcards: list[W.QFrame] = []
 
         for idx in range(2):
@@ -1718,11 +1860,14 @@ class MainWindow(W.QMainWindow):
             adv_grid.addWidget(chk_am, 0, 0)
             am_row = W.QHBoxLayout()
             am_row.setSpacing(4)
-            cmb_am_fn = _compact_combo(W.QComboBox(), 7)
-            cmb_am_fn.addItems(mod_fns)
-            cmb_am_fn.currentTextChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+            cmb_am_fn = _compact_combo(W.QComboBox(), 8)
+            cmb_am_fn.addItems(mod_fns + ["WAV (音频文件)"])
             freq_am = FreqUnitInput(min_hz=0.1, max_hz=1_000_000.0, default_hz=1_000.0)
             freq_am.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+            cmb_am_wav = self._populate_wav_combo(_compact_combo(W.QComboBox(), 16))
+            cmb_am_wav.setVisible(False)
+            cmb_am_wav.currentIndexChanged.connect(lambda _, i=idx: self._on_mod_wav_selected(i, "am"))
+            cmb_am_fn.currentTextChanged.connect(lambda txt, i=idx: self._on_mod_fn_changed(i, "am", txt))
             spn_am_depth = W.QDoubleSpinBox()
             spn_am_depth.setKeyboardTracking(False)
             spn_am_depth.setRange(0.0, 100.0)
@@ -1732,6 +1877,7 @@ class MainWindow(W.QMainWindow):
             spn_am_depth.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
             am_row.addWidget(cmb_am_fn)
             am_row.addWidget(freq_am, 1)
+            am_row.addWidget(cmb_am_wav, 1)
             am_row.addWidget(spn_am_depth)
             adv_grid.addLayout(am_row, 0, 1)
 
@@ -1741,11 +1887,14 @@ class MainWindow(W.QMainWindow):
             adv_grid.addWidget(chk_fm, 1, 0)
             fm_row = W.QHBoxLayout()
             fm_row.setSpacing(4)
-            cmb_fm_fn = _compact_combo(W.QComboBox(), 7)
-            cmb_fm_fn.addItems(mod_fns)
-            cmb_fm_fn.currentTextChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+            cmb_fm_fn = _compact_combo(W.QComboBox(), 8)
+            cmb_fm_fn.addItems(mod_fns + ["WAV (音频文件)"])
             freq_fm = FreqUnitInput(min_hz=0.1, max_hz=1_000_000.0, default_hz=1_000.0)
             freq_fm.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+            cmb_fm_wav = self._populate_wav_combo(_compact_combo(W.QComboBox(), 16))
+            cmb_fm_wav.setVisible(False)
+            cmb_fm_wav.currentIndexChanged.connect(lambda _, i=idx: self._on_mod_wav_selected(i, "fm"))
+            cmb_fm_fn.currentTextChanged.connect(lambda txt, i=idx: self._on_mod_fn_changed(i, "fm", txt))
             spn_fm_depth = W.QDoubleSpinBox()
             spn_fm_depth.setKeyboardTracking(False)
             spn_fm_depth.setRange(0.0, 100.0)
@@ -1755,6 +1904,7 @@ class MainWindow(W.QMainWindow):
             spn_fm_depth.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
             fm_row.addWidget(cmb_fm_fn)
             fm_row.addWidget(freq_fm, 1)
+            fm_row.addWidget(cmb_fm_wav, 1)
             fm_row.addWidget(spn_fm_depth)
             adv_grid.addLayout(fm_row, 1, 1)
 
@@ -1842,6 +1992,14 @@ class MainWindow(W.QMainWindow):
             if idx == 1:
                 adv_grid.addWidget(chk_sync_w1, 6, 0, 1, 2)
 
+            # SSB / VSB hardware carrier synthesis
+            adv_grid.addWidget(W.QLabel("SSB / VSB:"), 7, 0)
+            cmb_ssb = _compact_combo(W.QComboBox(), 14)
+            cmb_ssb.addItems(list(SSB_MODES))
+            cmb_ssb.setToolTip("单边带 (USB/LSB) 与残留边带 (VSB) 合成，使用 AM 频率与调制度参数")
+            cmb_ssb.currentTextChanged.connect(lambda txt, i=idx: self._on_ssb_changed(i, txt))
+            adv_grid.addWidget(cmb_ssb, 7, 1)
+
             p_layout.addWidget(adv_box)
             sub.setVisible(idx in self._active_awg_channels)
             card.body_layout.addWidget(sub)
@@ -1852,10 +2010,12 @@ class MainWindow(W.QMainWindow):
                 "chk_am": chk_am,
                 "cmb_am_fn": cmb_am_fn,
                 "freq_am": freq_am,
+                "cmb_am_wav": cmb_am_wav,
                 "spn_am_depth": spn_am_depth,
                 "chk_fm": chk_fm,
                 "cmb_fm_fn": cmb_fm_fn,
                 "freq_fm": freq_fm,
+                "cmb_fm_wav": cmb_fm_wav,
                 "spn_fm_depth": spn_fm_depth,
                 "spn_run_ms": spn_run_ms,
                 "spn_wait_ms": spn_wait_ms,
@@ -1867,6 +2027,9 @@ class MainWindow(W.QMainWindow):
                 "spn_limit_v": spn_limit_v,
                 "chk_sync_w1": chk_sync_w1,
                 "btn_load_custom": btn_load_custom,
+                "cmb_ssb": cmb_ssb,
+                "btn_adv": btn_adv,
+                "adv_box": adv_box,
             })
 
         self._sync_awg_channel_buttons()
@@ -2137,9 +2300,93 @@ class MainWindow(W.QMainWindow):
         except Exception as exc:
             self.lbl_status.setText(f"加载自定义波形失败: {exc}")
 
+    @staticmethod
+    def _populate_wav_combo(cmb: W.QComboBox) -> W.QComboBox:
+        hints = {
+            "fft_bounce_10k_90k_4s.wav": "10~90kHz 往返弹跳, 4.0s",
+            "fft_arpeggio_chord_3s.wav": "10~75kHz 跳频琶音, 3.0s",
+            "fft_chirp_5k_to_80k_3s.wav": "5~80kHz 线性扫频, 3.0s",
+            "fft_step_5k_to_80k_2s.wav": "5~80kHz 阶梯跃迁, 2.0s",
+            "fft_radar_burst_20k_80k_3s.wav": "20/50/80kHz 雷达脉冲, 3.0s",
+            "fft_tremolo_60k_2s.wav": "±60kHz 呼吸起伏, 2.0s",
+            "fft_morse_30k_2s.wav": "±30kHz 摩尔斯, 2.0s",
+        }
+        audio_dir = Path(__file__).resolve().parents[2] / "resources" / "audio"
+        if audio_dir.is_dir():
+            # Put wideband FFT clips first so they are immediately discoverable
+            files = sorted(audio_dir.glob("*.wav"), key=lambda p: (0 if p.name.startswith("fft_") else 1, p.name))
+            for wf_path in files:
+                hint = hints.get(wf_path.name)
+                if not hint:
+                    try:
+                        with wave.open(str(wf_path), "rb") as wf:
+                            sr = wf.getframerate()
+                            dur = wf.getnframes() / max(sr, 1)
+                        hint = f"≤{sr/2000:.1f}kHz, {dur:.1f}s"
+                    except Exception:
+                        hint = "WAV"
+                cmb.addItem(f"{wf_path.name} [{hint}]", str(wf_path))
+        cmb.addItem("📂 选择本地 WAV…", "__browse__")
+        return cmb
+
+    def _on_mod_fn_changed(self, idx: int, kind: str, txt: str):
+        adv = self.awg_adv_widgets[idx]
+        is_wav = txt == "WAV (音频文件)"
+        adv[f"freq_{kind}"].setVisible(not is_wav)
+        adv[f"cmb_{kind}_wav"].setVisible(is_wav)
+        store = self.awg_am_wav if kind == "am" else self.awg_fm_wav
+        if is_wav and store[idx] is None:
+            self._on_mod_wav_selected(idx, kind)
+        else:
+            self._emit_awg_config(idx)
+
+    def _on_mod_wav_selected(self, idx: int, kind: str):
+        cmb = self.awg_adv_widgets[idx][f"cmb_{kind}_wav"]
+        data = cmb.currentData()
+        if data == "__browse__":
+            path, _ = W.QFileDialog.getOpenFileName(
+                self, f"选择 W{idx + 1} {kind.upper()} 音频 (WAV)", "", "WAV Audio (*.wav);;All Files (*)"
+            )
+            if not path:
+                return
+            self._load_mod_wav_file(idx, kind, path)
+        elif data:
+            self._load_mod_wav_file(idx, kind, str(data))
+
+    def _load_mod_wav_file(self, idx: int, kind: str, path: str):
+        try:
+            with wave.open(path, "rb") as wf:
+                n_ch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                sr = float(wf.getframerate())
+                raw_bytes = wf.readframes(wf.getnframes())
+            if sw == 1:
+                arr = (np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float64) - 128.0) / 128.0
+            elif sw == 2:
+                arr = np.frombuffer(raw_bytes, dtype="<i2").astype(np.float64) / 32768.0
+            elif sw == 4:
+                arr = np.frombuffer(raw_bytes, dtype="<i4").astype(np.float64) / 2147483648.0
+            else:
+                raise ValueError(f"不支持的 WAV 位深: {sw * 8}-bit")
+            if n_ch > 1:
+                arr = arr.reshape(-1, n_ch).mean(axis=1)
+            peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+            if peak > 1e-6:
+                arr = arr / peak
+            store = self.awg_am_wav if kind == "am" else self.awg_fm_wav
+            store[idx] = (arr.tolist(), sr, Path(path).name)
+            self.lbl_status.setText(
+                f"W{idx + 1} {kind.upper()} 已加载: {Path(path).name} ({arr.size} pts @ {int(sr)} Hz)"
+            )
+            self._emit_awg_config(idx)
+        except Exception as exc:
+            self.lbl_status.setText(f"加载 WAV 失败: {exc}")
+
     def _emit_awg_config(self, idx: int):
         chk_en, cmb_fn, spn_freq, spn_amp, spn_off, spn_sym = self.awg_widgets[idx]
         adv = self.awg_adv_widgets[idx]
+        am_wav = self.awg_am_wav[idx]
+        fm_wav = self.awg_fm_wav[idx]
         cfg = AwgChannelConfig(
             enabled=(idx in self._active_awg_channels) and chk_en.isChecked(),
             function=cmb_fn.currentText(),
@@ -2153,10 +2400,15 @@ class MainWindow(W.QMainWindow):
             am_function=adv["cmb_am_fn"].currentText(),
             am_frequency_hz=float(adv["freq_am"].value()),
             am_depth_pct=float(adv["spn_am_depth"].value()),
+            am_wav_samples=am_wav[0] if am_wav else None,
+            am_wav_rate_hz=am_wav[1] if am_wav else 16_000.0,
             fm_enabled=adv["chk_fm"].isChecked(),
             fm_function=adv["cmb_fm_fn"].currentText(),
             fm_frequency_hz=float(adv["freq_fm"].value()),
             fm_depth_pct=float(adv["spn_fm_depth"].value()),
+            fm_wav_samples=fm_wav[0] if fm_wav else None,
+            fm_wav_rate_hz=fm_wav[1] if fm_wav else 16_000.0,
+            ssb_mode=adv["cmb_ssb"].currentText(),
             run_s=float(adv["spn_run_ms"].value()) * 1e-3,
             wait_s=float(adv["spn_wait_ms"].value()) * 1e-3,
             repeat_count=int(adv["spn_repeat"].value()),
@@ -2169,6 +2421,32 @@ class MainWindow(W.QMainWindow):
         )
         self.awg_cfgs[idx] = cfg
         self.req_awg_cfg.emit(idx, cfg)
+
+    def _on_ssb_changed(self, idx: int, txt: str):
+        self._emit_awg_config(idx)
+
+    def _on_waterfall_closed(self):
+        for btn in (self.btn_waterfall, self.btn_top_waterfall):
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
+
+    def _toggle_waterfall(self, checked: bool):
+        for btn in (self.btn_waterfall, self.btn_top_waterfall):
+            if btn.isChecked() != checked:
+                btn.blockSignals(True)
+                btn.setChecked(checked)
+                btn.blockSignals(False)
+        if checked:
+            cw = self.centralWidget()
+            if self.isVisible() and cw is not None and cw.width() > self.waterfall_overlay.width() + 24 and cw.height() > self.waterfall_overlay.height() + 68:
+                x = max(12, min(self.waterfall_overlay.x(), cw.width() - self.waterfall_overlay.width() - 12))
+                y = max(56, min(self.waterfall_overlay.y(), cw.height() - self.waterfall_overlay.height() - 12))
+                self.waterfall_overlay.move(x, y)
+            self.waterfall_overlay.show()
+            self.waterfall_overlay.raise_()
+        else:
+            self.waterfall_overlay.hide()
 
     def _clear_fft_hold(self):
         self.req_fft_cfg.emit({"clear_hold": True})
@@ -2265,14 +2543,19 @@ class MainWindow(W.QMainWindow):
                 self._update_fft_x_range(primary_fft)
         self.fft_plot.setYRange(-105.0, 10.0)
 
-    def _update_fft_x_range(self, primary_fft: dict):
+    def _update_fft_x_range(self, primary_fft: dict, saved_xrange: tuple[float, float] | None = None):
         freqs = primary_fft["freqs"]
         nyq = float(freqs[-1]) if freqs.size > 1 else 1e6
         span_sel = float(self.fft_span_input.value())
         fmax = nyq if span_sel <= 0.0 else min(nyq, max(5_000.0, span_sel))
         min_x_rng = min(5_000.0, fmax)
         self.fft_plot.getViewBox().setLimits(xMin=0.0, xMax=fmax, minXRange=min_x_rng, maxXRange=fmax)
-        self.fft_plot.setXRange(0.0, fmax, padding=0.0)
+        if saved_xrange is not None and saved_xrange[1] > saved_xrange[0]:
+            x0 = max(0.0, min(saved_xrange[0], fmax - min_x_rng))
+            x1 = min(fmax, max(x0 + min_x_rng, saved_xrange[1]))
+            self.fft_plot.setXRange(x0, x1, padding=0.0)
+        else:
+            self.fft_plot.setXRange(0.0, fmax, padding=0.0)
 
     def _on_frame_ready(self, data: dict):
         self._last_frame_data = data
@@ -2392,7 +2675,18 @@ class MainWindow(W.QMainWindow):
         if primary_fft:
             if not getattr(self, "_fft_x_initialized", False):
                 self._fft_x_initialized = True
-                self._update_fft_x_range(primary_fft)
+                saved_xr = getattr(self, "_saved_fft_xrange", None)
+                self._saved_fft_xrange = None
+                self._update_fft_x_range(primary_fft, saved_xrange=saved_xr)
+
+            if self.waterfall_overlay.isVisible():
+                fx_r, _ = self.fft_plot.getViewBox().viewRange()
+                self.waterfall_overlay.push_spectrum(
+                    primary_fft["freqs"],
+                    self._fft_convert_mag(primary_fft["dbv"]),
+                    float(fx_r[0]),
+                    float(fx_r[1]),
+                )
 
             met = primary_fft.get("metrics", {})
             if met:
@@ -2432,6 +2726,11 @@ class MainWindow(W.QMainWindow):
                         self.lbl_meas_fft,
                         f"{peaks_str}  |  SNR: {met['snr_db']:5.1f} dB  |  SFDR: {met['sfdr_db']:5.1f} dB",
                     )
+                else:
+                    self.fft_peaks_scatter.setData([], [])
+                    for lbl in self._peak_labels:
+                        lbl.setVisible(False)
+                    self._set_label_if_changed(self.lbl_meas_fft, "无显著波峰 (底噪状态)")
             gz = primary_fft.get("goertzel")
             if gz and self.chk_goertzel.isChecked():
                 self._set_label_if_changed(
@@ -2631,11 +2930,53 @@ class MainWindow(W.QMainWindow):
                         adv["cmb_idle"].setCurrentText(s.value(f"awg{idx}/idle", "Offset (偏置电平)", type=str))
                         adv["spn_limit_v"].setValue(s.value(f"awg{idx}/limit_v", 0.0, type=float))
                         adv["chk_sync_w1"].setChecked(s.value(f"awg{idx}/sync_w1", False, type=bool))
+                        adv["cmb_ssb"].setCurrentText(s.value(f"awg{idx}/ssb_mode", "Off (关闭)", type=str))
+                        adv_open = s.value(f"awg{idx}/adv_open", False, type=bool)
+                        adv["btn_adv"].setChecked(adv_open)
+                        adv["adv_box"].setVisible(adv_open)
+                        adv["btn_adv"].setText(("▾ " if adv_open else "▸ ") + "调制 / 突发 / 触发 / 同步 (AM/FM/Burst)")
+                        for kind in ("am", "fm"):
+                            wav_name = s.value(f"awg{idx}/{kind}_wav", "", type=str)
+                            if wav_name:
+                                widx = adv[f"cmb_{kind}_wav"].findText(wav_name)
+                                if widx >= 0:
+                                    adv[f"cmb_{kind}_wav"].setCurrentIndex(widx)
                         adv["btn_load_custom"].setVisible(cmb_fn.currentText() == "Custom (自定义)")
+                        for kind in ("am", "fm"):
+                            is_wav = adv[f"cmb_{kind}_fn"].currentText() == "WAV (音频文件)"
+                            adv[f"freq_{kind}"].setVisible(not is_wav)
+                            adv[f"cmb_{kind}_wav"].setVisible(is_wav)
                     finally:
                         del adv_blockers
+                    for kind in ("am", "fm"):
+                        store = self.awg_am_wav if kind == "am" else self.awg_fm_wav
+                        if adv[f"cmb_{kind}_fn"].currentText() == "WAV (音频文件)" and store[idx] is None:
+                            self._on_mod_wav_selected(idx, kind)
                 self.awg_subcards[idx].setVisible(idx in self._active_awg_channels)
             self._sync_awg_channel_buttons()
+
+            wf_w = max(360, s.value("waterfall/w", 620, type=int))
+            wf_h = max(170, s.value("waterfall/h", 250, type=int))
+            wf_x = s.value("waterfall/x", 28, type=int)
+            wf_y = s.value("waterfall/y", 86, type=int)
+            self.waterfall_overlay.resize(wf_w, wf_h)
+            self.waterfall_overlay.move(wf_x, wf_y)
+            wf_open = s.value("waterfall/open", False, type=bool)
+            self._toggle_waterfall(wf_open)
+
+            vx0 = s.value("fft/view_x0", None)
+            vx1 = s.value("fft/view_x1", None)
+            vy0 = s.value("fft/view_y0", None)
+            vy1 = s.value("fft/view_y1", None)
+            if vx0 is not None and vx1 is not None:
+                fx0, fx1 = float(vx0), float(vx1)
+                if fx1 > fx0:
+                    self._saved_fft_xrange = (fx0, fx1)
+                    self.fft_plot.setXRange(fx0, fx1, padding=0.0)
+            if vy0 is not None and vy1 is not None:
+                fy0, fy1 = float(vy0), float(vy1)
+                if fy1 > fy0:
+                    self.fft_plot.setYRange(fy0, fy1, padding=0.0)
         finally:
             del blockers
 
@@ -2691,6 +3032,11 @@ class MainWindow(W.QMainWindow):
         s.setValue("fft/zoom", self.chk_fft_zoom.isChecked())
         s.setValue("fft/goertzel_en", self.chk_goertzel.isChecked())
         s.setValue("fft/goertzel_hz", self.goertzel_freq.value())
+        fft_xr, fft_yr = self.fft_plot.getViewBox().viewRange()
+        s.setValue("fft/view_x0", float(fft_xr[0]))
+        s.setValue("fft/view_x1", float(fft_xr[1]))
+        s.setValue("fft/view_y0", float(fft_yr[0]))
+        s.setValue("fft/view_y1", float(fft_yr[1]))
 
         s.setValue("awg/open_channels", [str(i) for i in sorted(self._active_awg_channels)])
         for idx, (_, cmb_fn, spn_freq, spn_amp, spn_off, spn_sym) in enumerate(self.awg_widgets):
@@ -2718,6 +3064,15 @@ class MainWindow(W.QMainWindow):
             s.setValue(f"awg{idx}/idle", adv["cmb_idle"].currentText())
             s.setValue(f"awg{idx}/limit_v", adv["spn_limit_v"].value())
             s.setValue(f"awg{idx}/sync_w1", adv["chk_sync_w1"].isChecked())
+            s.setValue(f"awg{idx}/ssb_mode", adv["cmb_ssb"].currentText())
+            s.setValue(f"awg{idx}/adv_open", adv["btn_adv"].isChecked())
+            s.setValue(f"awg{idx}/am_wav", adv["cmb_am_wav"].currentText())
+            s.setValue(f"awg{idx}/fm_wav", adv["cmb_fm_wav"].currentText())
+        s.setValue("waterfall/open", self.waterfall_overlay.isVisible())
+        s.setValue("waterfall/x", self.waterfall_overlay.x())
+        s.setValue("waterfall/y", self.waterfall_overlay.y())
+        s.setValue("waterfall/w", self.waterfall_overlay.width())
+        s.setValue("waterfall/h", self.waterfall_overlay.height())
         s.sync()
 
     def closeEvent(self, event: QtGui.QCloseEvent):

@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes as C
 from dataclasses import dataclass, field
 import sys
+import threading
 import time
 import numpy as np
 from scipy import signal
@@ -82,6 +83,7 @@ funcPulse = 7
 funcTrapezium = 8
 funcSinePower = 9
 funcCustom = 30
+funcPlay = 31
 
 WAVEFORM_FUNCTIONS = {
     "Sine": funcSine,
@@ -119,6 +121,15 @@ TRIGGER_SLOPES = {
     "Falling": DwfTriggerSlopeFall,
     "Either": DwfTriggerSlopeEither,
 }
+
+SSB_MODES = (
+    "Off (关闭)",
+    "USB (上边带)",
+    "LSB (下边带)",
+    "USB+C (带载波上边带)",
+    "LSB+C (带载波下边带)",
+    "VSB (残留边带)",
+)
 
 ACQ_MODES = {
     "Single (标准单帧)": acqmodeSingle,
@@ -208,10 +219,15 @@ class AwgChannelConfig:
     am_function: str = "Sine"
     am_frequency_hz: float = 1_000.0
     am_depth_pct: float = 50.0
+    am_wav_samples: list[float] | None = None
+    am_wav_rate_hz: float = 16_000.0
     fm_enabled: bool = False
     fm_function: str = "Sine"
     fm_frequency_hz: float = 1_000.0
     fm_depth_pct: float = 10.0
+    fm_wav_samples: list[float] | None = None
+    fm_wav_rate_hz: float = 16_000.0
+    ssb_mode: str = "Off (关闭)"
     # Timing / Burst / Trigger / Idle / Sync / Limit
     run_s: float = 0.0  # 0.0 = continuous / infinite
     wait_s: float = 0.0
@@ -281,6 +297,18 @@ class AD3Driver:
         self._scope_dirty = True
         self._sim_phase = 0.0
         self._sos_cache: dict[tuple[int, float, float], np.ndarray] = {}
+        self._mod_play_stop: dict[tuple[int, int], threading.Event] = {}
+        self._mod_play_threads: dict[tuple[int, int], threading.Thread] = {}
+
+    def _stop_mod_play(self, ch_index: int | None = None):
+        keys = [k for k in self._mod_play_stop if ch_index is None or k[0] == ch_index]
+        for k in keys:
+            ev = self._mod_play_stop.pop(k, None)
+            if ev is not None:
+                ev.set()
+            th = self._mod_play_threads.pop(k, None)
+            if th is not None and th.is_alive():
+                th.join(timeout=0.3)
 
     @staticmethod
     def enumerate_devices() -> list[dict]:
@@ -348,8 +376,8 @@ class AD3Driver:
 
         ver = C.create_string_buffer(32)
         _dwf.FDwfGetVersion(ver)
-        # DwfParamOnClose = 0: keep AWG outputs running continuously even when application closes
-        _dwf.FDwfParamSet(C.c_int(DwfParamOnClose), C.c_int(0))
+        # DwfParamOnClose = 2: shutdown AD3 hardware to lowest power mode on close
+        _dwf.FDwfParamSet(C.c_int(DwfParamOnClose), C.c_int(2))
 
         devs = self.enumerate_devices()
         if not devs:
@@ -388,11 +416,17 @@ class AD3Driver:
         self.apply_scope_config()
         return self.device_info
 
-    def close(self, reset_awg: bool = False):
+    def close(self, reset_awg: bool = True):
+        self._stop_mod_play(None)
         if not self.demo and _dwf is not None and self.hdwf.value != hdwfNone:
             try:
+                if hasattr(_dwf, "FDwfDeviceParamSet"):
+                    _dwf.FDwfDeviceParamSet(self.hdwf, C.c_int(DwfParamOnClose), C.c_int(2))
+                _dwf.FDwfParamSet(C.c_int(DwfParamOnClose), C.c_int(2))
                 if reset_awg:
                     _dwf.FDwfAnalogOutReset(self.hdwf, C.c_int(-1))
+                    if hasattr(_dwf, "FDwfAnalogInReset"):
+                        _dwf.FDwfAnalogInReset(self.hdwf)
                 _dwf.FDwfDeviceClose(self.hdwf)
             except Exception:
                 pass
@@ -487,6 +521,7 @@ class AD3Driver:
 
     def configure_awg(self, ch_index: int, cfg: AwgChannelConfig):
         self.awg_cfg[ch_index] = cfg
+        self._stop_mod_play(ch_index)
         if self.demo or not self.is_open():
             return
 
@@ -529,6 +564,70 @@ class AD3Driver:
         if hasattr(_dwf, "FDwfAnalogOutLimitationSet") and cfg.limitation_v > 0.0:
             _dwf.FDwfAnalogOutLimitationSet(self.hdwf, c_ch, C.c_double(cfg.limitation_v))
 
+        if not cfg.ssb_mode.startswith("Off"):
+            n_pts = 4096
+            if hasattr(_dwf, "FDwfAnalogOutNodeDataInfo"):
+                d_min, d_max = C.c_int(0), C.c_int(0)
+                if _dwf.FDwfAnalogOutNodeDataInfo(self.hdwf, c_ch, node_c, C.byref(d_min), C.byref(d_max)) == 1 and d_max.value > 0:
+                    n_pts = min(4096, max(256, int(d_max.value)))
+            use_wav = (cfg.am_function == "WAV (音频文件)") and bool(cfg.am_wav_samples)
+            is_single_tone_ssb = cfg.ssb_mode.startswith("USB") and not cfg.ssb_mode.startswith("USB+C")
+            is_single_tone_ssb = is_single_tone_ssb or (cfg.ssb_mode.startswith("LSB") and not cfg.ssb_mode.startswith("LSB+C"))
+            wav_frames: list[tuple[float, float]] | None = None
+            if use_wav and cfg.am_wav_samples:
+                samples_w = np.clip(np.asarray(cfg.am_wav_samples, dtype=np.float64), -1.0, 1.0)
+                rate_w = max(1000.0, float(cfg.am_wav_rate_hz or 16000.0))
+                step_w = 0.012 if is_single_tone_ssb else 0.025
+                wav_frames = self._extract_wav_mod_frames(samples_w, rate_w, step_s=step_w)
+
+            if is_single_tone_ssb:
+                # Pure USB / LSB is a single sideband tone: hardware funcSine gives 100% glitch-free DDS sweeps!
+                is_usb = cfg.ssb_mode.startswith("USB")
+                f_m0, a0 = wav_frames[0] if wav_frames else (cfg.am_frequency_hz, 1.0)
+                f_out0 = (cfg.frequency_hz + f_m0) if is_usb else max(100.0, cfg.frequency_hz - f_m0)
+                amp0 = cfg.amplitude_v * (a0 if wav_frames else 1.0)
+                _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_c, C.c_int(1))
+                _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node_c, C.c_ubyte(funcSine))
+                _dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, c_ch, node_c, C.c_double(f_out0))
+                _dwf.FDwfAnalogOutNodeAmplitudeSet(self.hdwf, c_ch, node_c, C.c_double(amp0))
+                _dwf.FDwfAnalogOutNodeOffsetSet(self.hdwf, c_ch, node_c, C.c_double(cfg.offset_v))
+                _dwf.FDwfAnalogOutNodeSymmetrySet(self.hdwf, c_ch, node_c, C.c_double(50.0))
+                _dwf.FDwfAnalogOutNodePhaseSet(self.hdwf, c_ch, node_c, C.c_double(cfg.phase_deg))
+                _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_fm, C.c_int(0))
+                _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_am, C.c_int(0))
+                if _dwf.FDwfAnalogOutConfigure(self.hdwf, c_ch, C.c_int(1)) != 1:
+                    raise DwfError(f"配置信号发生器 W{ch_index + 1} 失败: " + self._last_error())
+                if wav_frames is not None:
+                    self._start_mod_play_thread(
+                        ch_index, AnalogOutNodeCarrier, ("ssb_sine_track", wav_frames, cfg, is_usb, step_w)
+                    )
+                return
+
+            f_m_init = wav_frames[0][0] if wav_frames else cfg.am_frequency_hz
+            depth_init = (cfg.am_depth_pct * wav_frames[0][1]) if wav_frames else cfg.am_depth_pct
+            amp_init = cfg.amplitude_v
+
+            ssb_samples, rep_freq_hz = self._synthesize_ssb_vsb(
+                cfg.frequency_hz, f_m_init, depth_init, cfg.ssb_mode, n_pts=n_pts
+            )
+            _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_c, C.c_int(1))
+            _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node_c, C.c_ubyte(funcCustom))
+            arr = (C.c_double * ssb_samples.size)(*ssb_samples.tolist())
+            if _dwf.FDwfAnalogOutNodeDataSet(self.hdwf, c_ch, node_c, arr, C.c_int(ssb_samples.size)) != 1:
+                raise DwfError(f"设置 SSB/VSB 波形数据失败 W{ch_index + 1}: " + self._last_error())
+            _dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, c_ch, node_c, C.c_double(rep_freq_hz))
+            _dwf.FDwfAnalogOutNodeAmplitudeSet(self.hdwf, c_ch, node_c, C.c_double(amp_init))
+            _dwf.FDwfAnalogOutNodeOffsetSet(self.hdwf, c_ch, node_c, C.c_double(cfg.offset_v))
+            _dwf.FDwfAnalogOutNodeSymmetrySet(self.hdwf, c_ch, node_c, C.c_double(50.0))
+            _dwf.FDwfAnalogOutNodePhaseSet(self.hdwf, c_ch, node_c, C.c_double(cfg.phase_deg))
+            _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_fm, C.c_int(0))
+            _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_am, C.c_int(0))
+            if _dwf.FDwfAnalogOutConfigure(self.hdwf, c_ch, C.c_int(1)) != 1:
+                raise DwfError(f"配置信号发生器 W{ch_index + 1} 失败: " + self._last_error())
+            if wav_frames is not None:
+                self._start_mod_play_thread(ch_index, AnalogOutNodeCarrier, ("ssb_track", wav_frames, cfg, n_pts))
+            return
+
         func_id = WAVEFORM_FUNCTIONS.get(cfg.function, funcSine)
         _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_c, C.c_int(1))
         _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node_c, C.c_ubyte(func_id))
@@ -543,26 +642,255 @@ class AD3Driver:
             arr = (C.c_double * samples.size)(*samples.tolist())
             _dwf.FDwfAnalogOutNodeDataSet(self.hdwf, c_ch, node_c, arr, C.c_int(samples.size))
 
-        if cfg.fm_enabled:
-            fm_func = WAVEFORM_FUNCTIONS.get(cfg.fm_function, funcSine)
-            _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_fm, C.c_int(1))
-            _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node_fm, C.c_ubyte(fm_func))
-            _dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, c_ch, node_fm, C.c_double(cfg.fm_frequency_hz))
-            _dwf.FDwfAnalogOutNodeAmplitudeSet(self.hdwf, c_ch, node_fm, C.c_double(cfg.fm_depth_pct))
-        else:
-            _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_fm, C.c_int(0))
-
-        if cfg.am_enabled:
-            am_func = WAVEFORM_FUNCTIONS.get(cfg.am_function, funcSine)
-            _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_am, C.c_int(1))
-            _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node_am, C.c_ubyte(am_func))
-            _dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, c_ch, node_am, C.c_double(cfg.am_frequency_hz))
-            _dwf.FDwfAnalogOutNodeAmplitudeSet(self.hdwf, c_ch, node_am, C.c_double(cfg.am_depth_pct))
-        else:
-            _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node_am, C.c_int(0))
+        fm_play = self._configure_mod_node(
+            c_ch, node_fm, cfg.fm_enabled, cfg.fm_function, cfg.fm_frequency_hz, cfg.fm_depth_pct,
+            cfg.fm_wav_samples, cfg.fm_wav_rate_hz,
+        )
+        am_play = self._configure_mod_node(
+            c_ch, node_am, cfg.am_enabled, cfg.am_function, cfg.am_frequency_hz, cfg.am_depth_pct,
+            cfg.am_wav_samples, cfg.am_wav_rate_hz,
+        )
 
         if _dwf.FDwfAnalogOutConfigure(self.hdwf, c_ch, C.c_int(1)) != 1:
             raise DwfError(f"配置信号发生器 W{ch_index + 1} 失败: " + self._last_error())
+
+        if fm_play is not None:
+            self._start_mod_play_thread(ch_index, AnalogOutNodeFM, fm_play)
+        if am_play is not None:
+            self._start_mod_play_thread(ch_index, AnalogOutNodeAM, am_play)
+
+    def _configure_mod_node(
+        self,
+        c_ch: C.c_int,
+        node: C.c_int,
+        enabled: bool,
+        fn_name: str,
+        freq_hz: float,
+        depth_pct: float,
+        wav_samples: list[float] | None,
+        wav_rate_hz: float,
+    ) -> tuple[np.ndarray, int] | None:
+        if not enabled:
+            _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node, C.c_int(0))
+            return None
+        _dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, c_ch, node, C.c_int(1))
+        _dwf.FDwfAnalogOutNodeAmplitudeSet(self.hdwf, c_ch, node, C.c_double(depth_pct))
+        if fn_name == "WAV (音频文件)" and wav_samples:
+            samples = np.clip(np.asarray(wav_samples, dtype=np.float64), -1.0, 1.0)
+            rate_hz = max(1000.0, float(wav_rate_hz or 16000.0))
+            play_max, data_max = C.c_int(0), C.c_int(0)
+            if hasattr(_dwf, "FDwfAnalogOutNodeDataInfo"):
+                _dwf.FDwfAnalogOutNodeDataInfo(self.hdwf, c_ch, node, C.c_int(0), C.byref(data_max))
+            if hasattr(_dwf, "FDwfAnalogOutNodePlayInfo"):
+                p_min = C.c_int(0)
+                _dwf.FDwfAnalogOutNodePlayInfo(self.hdwf, c_ch, node, C.byref(p_min), C.byref(play_max))
+            if samples.size > 4096 and play_max.value > 0 and hasattr(_dwf, "FDwfAnalogOutNodePlayData"):
+                _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node, C.c_ubyte(funcPlay))
+                _dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, c_ch, node, C.c_double(rate_hz))
+                n_pre = min(int(data_max.value or 2048), samples.size)
+                arr_pre = (C.c_double * n_pre)(*samples[:n_pre].tolist())
+                _dwf.FDwfAnalogOutNodeDataSet(self.hdwf, c_ch, node, arr_pre, C.c_int(n_pre))
+                return ("play", samples, n_pre)
+            if samples.size <= int(data_max.value or 4096):
+                dur_s = samples.size / rate_hz
+                _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node, C.c_ubyte(funcCustom))
+                _dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, c_ch, node, C.c_double(1.0 / max(dur_s, 1e-4)))
+                arr = (C.c_double * samples.size)(*samples.tolist())
+                _dwf.FDwfAnalogOutNodeDataSet(self.hdwf, c_ch, node, arr, C.c_int(samples.size))
+                return None
+            # AM/FM nodes on AD3 do not have a streaming Play FIFO; track dominant frequency & RMS envelope via funcSine @ 40 Hz
+            frames = self._extract_wav_mod_frames(samples, rate_hz, step_s=0.025)
+            f0, a0 = frames[0]
+            _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node, C.c_ubyte(funcSine))
+            _dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, c_ch, node, C.c_double(max(1.0, f0)))
+            _dwf.FDwfAnalogOutNodeAmplitudeSet(self.hdwf, c_ch, node, C.c_double(depth_pct * a0))
+            return ("sine_track", frames, depth_pct)
+        func_id = WAVEFORM_FUNCTIONS.get(fn_name, funcSine)
+        _dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, c_ch, node, C.c_ubyte(func_id))
+        _dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, c_ch, node, C.c_double(freq_hz))
+        return None
+
+    @staticmethod
+    def _synthesize_ssb_vsb(
+        f_c: float, f_m: float, depth_pct: float, mode: str, n_pts: int = 4096
+    ) -> tuple[np.ndarray, float]:
+        """Synthesize a seamless periodic SSB (USB/LSB, with or without carrier) or VSB RF waveform."""
+        f_c = max(1000.0, float(f_c))
+        f_m = max(100.0, float(f_m))
+        m = float(np.clip(float(depth_pct) / 100.0, 0.0, 1.0))
+        # Pick the lowest exact integer divisor of 100 MHz >= 5*(f_c+f_m) for finest df & zero DDS jitter
+        min_dac = max(1_000_000.0, 5.0 * (f_c + f_m))
+        divisors = (1, 2, 4, 5, 8, 10, 16, 20, 25, 40, 50, 80, 100, 125, 200, 250, 400, 500, 1000)
+        f_dac = 100_000_000.0
+        for div in reversed(divisors):
+            cand = 100_000_000.0 / float(div)
+            if cand >= min_dac:
+                f_dac = cand
+                break
+        df = f_dac / float(n_pts)
+        k_c = max(2, int(round(f_c / df)))
+        k_m = max(1, int(round(f_m / df)))
+        if k_c + k_m >= n_pts // 2 - 4:
+            f_dac = 100_000_000.0
+            df = f_dac / float(n_pts)
+            k_c = max(2, int(round(f_c / df)))
+            k_m = max(1, int(round(f_m / df)))
+        theta = 2.0 * np.pi * np.arange(n_pts, dtype=np.float64) / float(n_pts)
+        if mode.startswith("USB+C"):
+            y = np.cos(k_c * theta) + m * np.cos((k_c + k_m) * theta)
+        elif mode.startswith("LSB+C"):
+            y = np.cos(k_c * theta) + m * np.cos(max(1, k_c - k_m) * theta)
+        elif mode.startswith("USB"):
+            y = np.cos((k_c + k_m) * theta)
+        elif mode.startswith("LSB"):
+            y = np.cos(max(1, k_c - k_m) * theta)
+        else:  # VSB: carrier + full USB + 25% vestigial LSB
+            y = (
+                np.cos(k_c * theta)
+                + m * np.cos((k_c + k_m) * theta)
+                + 0.25 * m * np.cos(max(1, k_c - k_m) * theta)
+            )
+        peak = float(np.max(np.abs(y)))
+        if peak > 1e-9:
+            y = y / peak
+        return y, f_dac / float(n_pts)
+
+    @staticmethod
+    def _extract_wav_mod_frames(samples: np.ndarray, rate_hz: float, step_s: float = 0.025) -> list[tuple[float, float]]:
+        """Slice a WAV into short frames and extract (dominant_freq_hz, normalized_amp) for hardware Sine tracking."""
+        step_n = max(128, int(round(rate_hz * step_s)))
+        win = np.hanning(step_n)
+        freqs = np.fft.rfftfreq(step_n, d=1.0 / rate_hz)
+        frames: list[tuple[float, float]] = []
+        rms_vals = []
+        raw_freqs = []
+        for start in range(0, samples.size, step_n):
+            seg = samples[start : start + step_n]
+            if seg.size < step_n:
+                seg = np.pad(seg, (0, step_n - seg.size))
+            rms = float(np.sqrt(np.mean(seg * seg)))
+            rms_vals.append(rms)
+            if rms < 1e-4:
+                raw_freqs.append(raw_freqs[-1] if raw_freqs else 1000.0)
+            else:
+                spec = np.abs(np.fft.rfft(seg * win))
+                idx = int(np.argmax(spec[1:])) + 1 if spec.size > 1 else 1
+                raw_freqs.append(float(freqs[idx]))
+        max_rms = max(rms_vals) if rms_vals else 1.0
+        if max_rms < 1e-6:
+            max_rms = 1.0
+        for f, r in zip(raw_freqs, rms_vals):
+            amp_norm = min(1.0, r / max_rms)
+            if amp_norm < 0.03:
+                amp_norm = 0.0
+            frames.append((f, amp_norm))
+        return frames or [(1000.0, 0.0)]
+
+    def _start_mod_play_thread(self, ch_index: int, node_id: int, plan: tuple):
+        stop_ev = threading.Event()
+        self._mod_play_stop[(ch_index, node_id)] = stop_ev
+        hdwf_ref = self.hdwf
+        c_ch = C.c_int(ch_index)
+        c_node = C.c_int(node_id)
+        mode = plan[0]
+
+        if mode == "sine_track":
+            frames: list[tuple[float, float]] = plan[1]
+            depth_pct = float(plan[2])
+
+            def _tracker():
+                idx = 1 if len(frames) > 1 else 0
+                while not stop_ev.wait(0.025) and hdwf_ref.value != hdwfNone:
+                    f_hz, a_norm = frames[idx]
+                    _dwf.FDwfAnalogOutNodeFrequencySet(hdwf_ref, c_ch, c_node, C.c_double(max(1.0, f_hz)))
+                    _dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf_ref, c_ch, c_node, C.c_double(depth_pct * a_norm))
+                    _dwf.FDwfAnalogOutConfigure(hdwf_ref, c_ch, C.c_int(3))  # 3 = apply live
+                    idx = (idx + 1) % len(frames)
+
+            th = threading.Thread(target=_tracker, daemon=True, name=f"awg-mod-track-w{ch_index + 1}-n{node_id}")
+            self._mod_play_threads[(ch_index, node_id)] = th
+            th.start()
+            return
+
+        if mode == "ssb_sine_track":
+            frames: list[tuple[float, float]] = plan[1]
+            cfg_ssb: AwgChannelConfig = plan[2]
+            is_usb: bool = bool(plan[3])
+            step_s: float = float(plan[4])
+
+            def _ssb_sine_tracker():
+                idx = 1 if len(frames) > 1 else 0
+                while not stop_ev.wait(step_s) and hdwf_ref.value != hdwfNone:
+                    f_hz, a_norm = frames[idx]
+                    f_out = (cfg_ssb.frequency_hz + f_hz) if is_usb else max(100.0, cfg_ssb.frequency_hz - f_hz)
+                    _dwf.FDwfAnalogOutNodeFrequencySet(hdwf_ref, c_ch, c_node, C.c_double(f_out))
+                    _dwf.FDwfAnalogOutNodeAmplitudeSet(hdwf_ref, c_ch, c_node, C.c_double(cfg_ssb.amplitude_v * a_norm))
+                    _dwf.FDwfAnalogOutConfigure(hdwf_ref, c_ch, C.c_int(3))
+                    idx = (idx + 1) % len(frames)
+
+            th = threading.Thread(target=_ssb_sine_tracker, daemon=True, name=f"awg-ssb-sine-w{ch_index + 1}")
+            self._mod_play_threads[(ch_index, node_id)] = th
+            th.start()
+            return
+
+        if mode == "ssb_track":
+            frames: list[tuple[float, float]] = plan[1]
+            cfg_ssb: AwgChannelConfig = plan[2]
+            n_pts_ssb: int = int(plan[3])
+
+            def _ssb_tracker():
+                idx = 1 if len(frames) > 1 else 0
+                last_key = None
+                while not stop_ev.wait(0.025) and hdwf_ref.value != hdwfNone:
+                    f_hz, a_norm = frames[idx]
+                    depth_now = cfg_ssb.am_depth_pct * a_norm
+                    key = (round(f_hz / 500.0), round(depth_now, 1))
+                    if key != last_key:
+                        last_key = key
+                        y_now, rep_f_now = self._synthesize_ssb_vsb(
+                            cfg_ssb.frequency_hz, f_hz, depth_now, cfg_ssb.ssb_mode, n_pts=n_pts_ssb
+                        )
+                        arr_now = (C.c_double * y_now.size)(*y_now.tolist())
+                        _dwf.FDwfAnalogOutNodeDataSet(hdwf_ref, c_ch, c_node, arr_now, C.c_int(y_now.size))
+                        _dwf.FDwfAnalogOutNodeFrequencySet(hdwf_ref, c_ch, c_node, C.c_double(rep_f_now))
+                        _dwf.FDwfAnalogOutConfigure(hdwf_ref, c_ch, C.c_int(3))
+                    idx = (idx + 1) % len(frames)
+
+            th = threading.Thread(target=_ssb_tracker, daemon=True, name=f"awg-ssb-track-w{ch_index + 1}")
+            self._mod_play_threads[(ch_index, node_id)] = th
+            th.start()
+            return
+
+        samples: np.ndarray = plan[1]
+        n_pre: int = plan[2]
+        n_total = samples.size
+        start_idx = n_pre % n_total
+
+        def _feeder():
+            pos = start_idx
+            c_sts = C.c_ubyte()
+            c_free, c_lost, c_corr = C.c_int(), C.c_int(), C.c_int()
+            while not stop_ev.is_set() and hdwf_ref.value != hdwfNone:
+                _dwf.FDwfAnalogOutStatus(hdwf_ref, c_ch, C.byref(c_sts))
+                if _dwf.FDwfAnalogOutNodePlayStatus(hdwf_ref, c_ch, c_node, C.byref(c_free), C.byref(c_lost), C.byref(c_corr)) != 1:
+                    break
+                free = int(c_free.value)
+                if free >= 256:
+                    chunk_n = min(free, 2048)
+                    end = pos + chunk_n
+                    if end <= n_total:
+                        chunk = samples[pos:end]
+                    else:
+                        chunk = np.concatenate([samples[pos:], samples[: end % n_total]])
+                    pos = end % n_total
+                    arr_c = (C.c_double * chunk.size)(*chunk.tolist())
+                    _dwf.FDwfAnalogOutNodePlayData(hdwf_ref, c_ch, c_node, arr_c, C.c_int(chunk.size))
+                else:
+                    stop_ev.wait(0.01)
+
+        th = threading.Thread(target=_feeder, daemon=True, name=f"awg-mod-play-w{ch_index + 1}-n{node_id}")
+        self._mod_play_threads[(ch_index, node_id)] = th
+        th.start()
 
     def trigger_pc(self):
         if self.demo or not self.is_open():
@@ -860,8 +1188,15 @@ class AD3Driver:
         two_pi = np.float32(2.0 * np.pi)
         w1, w2 = self.awg_cfg[0], self.awg_cfg[1]
 
-        # If both W1 and W2 are enabled at different frequencies (>100 kHz), simulate realistic RF mixer IF output on CH1
-        if w1.enabled and w2.enabled and abs(w1.frequency_hz - w2.frequency_hz) >= 1_000.0 and min(w1.frequency_hz, w2.frequency_hz) >= 250_000.0:
+        # If both W1 and W2 are enabled at different frequencies (>100 kHz) without SSB/VSB, simulate RF mixer IF output on CH1
+        if (
+            w1.enabled
+            and w2.enabled
+            and w1.ssb_mode.startswith("Off")
+            and w2.ssb_mode.startswith("Off")
+            and abs(w1.frequency_hz - w2.frequency_hz) >= 1_000.0
+            and min(w1.frequency_hz, w2.frequency_hz) >= 250_000.0
+        ):
             f_diff = np.float32(abs(w2.frequency_hz - w1.frequency_hz))
             f_sum = np.float32(w1.frequency_hz + w2.frequency_hz)
             scale = np.float32(0.5 * (w1.amplitude_v + w2.amplitude_v))
@@ -895,7 +1230,27 @@ class AD3Driver:
             if cfg.trigger.mode == "None":
                 phase = phase + np.float32(self._sim_phase)
 
-            if fn == "Sine":
+            if awg.enabled and not awg.ssb_mode.startswith("Off"):
+                f_m = np.float32(max(100.0, awg.am_frequency_hz))
+                m_depth = np.float32(np.clip(awg.am_depth_pct / 100.0, 0.05, 1.0))
+                ph_m = two_pi * f_m * t + (np.float32(self._sim_phase) if cfg.trigger.mode == "None" else np.float32(0.0))
+                ph_usb = two_pi * (f + f_m) * t + np.float32(np.deg2rad(awg.phase_deg))
+                ph_lsb = two_pi * np.float32(max(100.0, float(f) - float(f_m))) * t + np.float32(np.deg2rad(awg.phase_deg))
+                if awg.ssb_mode.startswith("USB+C"):
+                    y = np.cos(phase) + m_depth * np.cos(ph_usb)
+                elif awg.ssb_mode.startswith("LSB+C"):
+                    y = np.cos(phase) + m_depth * np.cos(ph_lsb)
+                elif awg.ssb_mode.startswith("USB"):
+                    y = np.cos(ph_usb)
+                elif awg.ssb_mode.startswith("LSB"):
+                    y = np.cos(ph_lsb)
+                else:  # VSB
+                    y = np.cos(phase) + m_depth * np.cos(ph_usb) + np.float32(0.25) * m_depth * np.cos(ph_lsb)
+                pk = float(np.max(np.abs(y)))
+                if pk > 1e-9:
+                    y = (amp / np.float32(pk)) * y
+                _ = ph_m
+            elif fn == "Sine":
                 y = amp * np.sin(phase) + np.float32(0.025) * amp * np.sin(np.float32(3.0) * phase)
             elif fn == "Square":
                 duty = np.float32(np.clip(awg.symmetry_pct / 100.0, 0.05, 0.95))
