@@ -1,0 +1,28 @@
+[project]
+name = "wavedesk"
+version = "0.1.0"
+description = "Next-generation GPU-accelerated oscilloscope, FFT analyzer, and waveform generator for Digilent Analog Discovery 3"
+requires-python = ">=3.12"
+dependencies = [
+    "pyside6>=6.8,<7",
+    "pyqtgraph>=0.13.7,<0.15",
+    "numpy>=2,<3",
+    "scipy>=1.14,<2",
+    "pyopencl>=2024.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+wavedesk = "wavedesk.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wavedesk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
