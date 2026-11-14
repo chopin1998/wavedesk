@@ -80,7 +80,7 @@ out vec4 fragColor;
 void main() {
     float d = abs(v_edge);
     // Smooth SDF core + subtle outer bloom
-    float core = smoothstep(0.75, 0.0, d);
+    float core = 1.0 - smoothstep(0.0, 0.75, d);
     if (u_glow_mode == 1) {
         float halo = exp(-6.0 * d * d);
         vec3 col = mix(u_color.rgb, vec3(1.0, 1.0, 1.0), core * 0.25);
@@ -211,8 +211,8 @@ def build_sdf_ribbon_vertices(
 
     # Hardware-style Min/Max Peak-Detect decimation when sample count exceeds 2x pixel width
     if n > max_segments * 2:
-        buckets = max_segments
-        step = n // buckets
+        step = max(2, (n + max_segments - 1) // max_segments)
+        buckets = n // step
         usable = buckets * step
         xr = x[:usable].reshape(buckets, step)
         yr = y[:usable].reshape(buckets, step)
@@ -221,17 +221,30 @@ def build_sdf_ribbon_vertices(
         rows = np.arange(buckets)
         first_min = idx_min <= idx_max
 
-        x_out = np.empty(buckets * 2, dtype=np.float32)
-        y_out = np.empty(buckets * 2, dtype=np.float32)
         x_min = xr[rows, idx_min]
         y_min = yr[rows, idx_min]
         x_max = xr[rows, idx_max]
         y_max = yr[rows, idx_max]
 
-        x_out[0::2] = np.where(first_min, x_min, x_max)
-        y_out[0::2] = np.where(first_min, y_min, y_max)
-        x_out[1::2] = np.where(first_min, x_max, x_min)
-        y_out[1::2] = np.where(first_min, y_max, y_min)
+        rem = n - usable
+        extra = 2 if rem >= 2 else (1 if rem == 1 else 0)
+        x_out = np.empty(buckets * 2 + extra, dtype=np.float32)
+        y_out = np.empty(buckets * 2 + extra, dtype=np.float32)
+        x_out[: buckets * 2 : 2] = np.where(first_min, x_min, x_max)
+        y_out[: buckets * 2 : 2] = np.where(first_min, y_min, y_max)
+        x_out[1 : buckets * 2 : 2] = np.where(first_min, x_max, x_min)
+        y_out[1 : buckets * 2 : 2] = np.where(first_min, y_max, y_min)
+        if rem >= 2:
+            xr_t, yr_t = x[usable:], y[usable:]
+            i_min, i_max = int(np.argmin(yr_t)), int(np.argmax(yr_t))
+            if i_min <= i_max:
+                x_out[-2], y_out[-2] = xr_t[i_min], yr_t[i_min]
+                x_out[-1], y_out[-1] = xr_t[i_max], yr_t[i_max]
+            else:
+                x_out[-2], y_out[-2] = xr_t[i_max], yr_t[i_max]
+                x_out[-1], y_out[-1] = xr_t[i_min], yr_t[i_min]
+        elif rem == 1:
+            x_out[-1], y_out[-1] = x[-1], y[-1]
         x, y = x_out, y_out
         n = x.size
 

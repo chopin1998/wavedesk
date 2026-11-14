@@ -2,6 +2,8 @@
 
 WaveDesk 是一个面向 Digilent Analog Discovery 3（AD3）的桌面工具，可以查看双通道波形、分析频谱，并控制双通道信号发生器。没有设备时，也可以用内置的模拟信号体验界面。
 
+![WaveDesk 界面截图](docs/screenshot.png)
+
 ## 功能
 
 - **示波器**：查看 CH1 和 CH2 波形，调整采样、通道和触发设置，并查看波形测量值。

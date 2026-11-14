@@ -111,6 +111,8 @@ class InstrumentWorker(QObject):
 
     @Slot(object)
     def update_scope_config(self, cfg: ScopeConfig):
+        if cfg == self.driver.scope_cfg:
+            return
         self.driver.scope_cfg = cfg
         self.driver._scope_dirty = True
         self._fft_accum.clear()
@@ -142,6 +144,17 @@ class InstrumentWorker(QObject):
         try:
             self.driver.force_scope_trigger()
             self.status_changed.emit("已发送示波器强制触发")
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+    @Slot(bool, float, float)
+    def update_power_supply(self, enabled: bool, v_pos: float, v_neg: float):
+        try:
+            self.driver.configure_power_supplies(enabled, v_pos, v_neg)
+            if enabled:
+                self.status_changed.emit(f"AD3 供电已开启 · V+={v_pos:+.2f}V, V-={v_neg:+.2f}V")
+            else:
+                self.status_changed.emit("AD3 V+/V- 供电已关闭")
         except Exception as exc:
             self.error_occurred.emit(str(exc))
 

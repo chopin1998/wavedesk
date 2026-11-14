@@ -25,13 +25,13 @@ def measure_channel(
     vac_rms = float(np.std(y_core))
 
     mid = 0.5 * (vmax + vmin)
-    hyst = max(0.06 * vpp, 0.008)
+    hyst = max(0.06 * vpp, 0.0005)
     freq_hz = 0.0
     period_s = 0.0
     duty_pct = 50.0
     rise_s = 0.0
 
-    if vpp > 0.025:
+    if vpp > 0.0015:
         above = y_core > mid
         raw_cross = np.where((~above[:-1]) & above[1:])[0]
         if raw_cross.size >= 2:

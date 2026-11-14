@@ -452,6 +452,40 @@ class GpuFftEngine:
         f0 = max(0.0, float(f_start))
         f1 = min(fs * 0.5, max(f0 + 100.0, float(f_stop)))
         m = int(max(64, m_bins))
+        df_native = fs / float(max(n, 1))
+        df_czt = (f1 - f0) / float(max(m - 1, 1))
+
+        # Never allow Zoom-FFT bin spacing to be coarser than 0.5x the native FFT bin width (which causes
+        # severe main-lobe undersampling / scalloping loss and sidelobe spikes when [f0, f1] is wide).
+        if df_czt >= 0.5 * df_native and n >= 256:
+            pad_n = max(65536, 1 << int(math.ceil(math.log2(max(n * 2, 1024)))))
+            full_res = self.compute(
+                x,
+                fs,
+                window_name=window_name,
+                pad_to=pad_n,
+                compute_metrics=False,
+            )
+            f_all = full_res["freqs"]
+            i0 = max(0, int(np.searchsorted(f_all, f0, side="left")))
+            i1 = min(f_all.size, int(np.searchsorted(f_all, f1, side="right")) + 1)
+            freqs = f_all[i0:i1]
+            mag_dbv = full_res["dbv"][i0:i1]
+            mag_vrms = full_res["vrms"][i0:i1]
+            self.last_compute_ms = (time.perf_counter() - t0) * 1000.0
+            metrics = self._compute_spectral_metrics(freqs, mag_dbv, mag_vrms) if compute_metrics else {}
+            return {
+                "freqs": freqs,
+                "dbv": mag_dbv,
+                "vrms": mag_vrms,
+                "phase": None,
+                "n_fft": pad_n,
+                "backend": "czt-zoom",
+                "device_name": "Zoom-FFT (Hi-Res)",
+                "compute_ms": self.last_compute_ms,
+                "metrics": metrics,
+            }
+
         w_ratio = np.exp(-2j * np.pi * (f1 - f0) / (max(m - 1, 1) * fs))
         a_start = np.exp(2j * np.pi * f0 / fs)
         spec = signal.czt(xw, m=m, w=w_ratio, a=a_start)
@@ -530,15 +564,7 @@ class GpuFftEngine:
         fund_idx = 3 + int(np.argmax(vrms[3:]))
         fund_freq, fund_dbv = GpuFftEngine._interp_peak(freqs, dbv, fund_idx)
         fund_vrms = float(vrms[fund_idx])
-
-        # Parabolic interpolation around peak for sub-bin frequency estimation
         df = float(freqs[1] - freqs[0]) if n > 1 else 1.0
-        if 1 <= fund_idx < n - 1:
-            y0, y1, y2 = float(dbv[fund_idx - 1]), float(dbv[fund_idx]), float(dbv[fund_idx + 1])
-            denom = y0 - 2.0 * y1 + y2
-            if abs(denom) > 1e-6:
-                delta = 0.5 * (y0 - y2) / denom
-                fund_freq = float(freqs[fund_idx] + delta * df)
 
         # Total power minus DC and fundamental/harmonics for fast O(1) THD & SNR
         total_power = float(np.dot(vrms[3:], vrms[3:]))
@@ -571,7 +597,7 @@ class GpuFftEngine:
 
         # Fast local maxima detection using neighbor comparison (10x faster than scipy.signal.find_peaks)
         noise_med = float(np.median(dbv[3:])) if n > 8 else -90.0
-        peak_thresh = max(noise_med + 15.0, -82.0)
+        peak_thresh = max(noise_med + 12.0, -110.0)
         mid = dbv[3:-1]
         is_local_max = (mid > dbv[2:-2]) & (mid >= dbv[4:]) & (mid > peak_thresh)
         cand_idx = np.nonzero(is_local_max)[0] + 3
@@ -580,15 +606,16 @@ class GpuFftEngine:
         if cand_idx.size > 0:
             order = np.argsort(dbv[cand_idx])[::-1]
             selected = []
-            min_sep = max(4, min(12, n // 1500))
+            min_sep = max(4, min(16, n // 120))
+            loc_hw = max(24, n // 24)
             for idx in cand_idx[order]:
                 i_int = int(idx)
                 if not all(abs(i_int - s[0]) >= min_sep for s in selected):
                     continue
-                lo_loc = max(3, i_int - 24)
-                hi_loc = min(n, i_int + 25)
+                lo_loc = max(3, i_int - loc_hw)
+                hi_loc = min(n, i_int + loc_hw + 1)
                 local_med = float(np.median(dbv[lo_loc:hi_loc]))
-                if float(dbv[i_int]) < local_med + 14.0:
+                if float(dbv[i_int]) < local_med + 10.0:
                     continue
                 pf, pd = GpuFftEngine._interp_peak(freqs, dbv, i_int)
                 selected.append((i_int, pf, pd))
@@ -610,3 +637,47 @@ class GpuFftEngine:
             "sfdr_db": sfdr_db,
             "peaks": top_peaks,
         }
+
+    @staticmethod
+    def find_peaks_in_band(
+        freqs: np.ndarray,
+        dbv: np.ndarray,
+        f_min: float,
+        f_max: float,
+        max_peaks: int = 8,
+    ) -> list[tuple[float, float]]:
+        """Detect top spectral peaks strictly within [f_min, f_max] so out-of-band harmonics never hide in-band IF peaks."""
+        n = freqs.size
+        if n < 8 or f_max <= f_min:
+            return []
+        i0 = max(3, int(np.searchsorted(freqs, f_min, side="left")))
+        i1 = min(n - 1, int(np.searchsorted(freqs, f_max, side="right")))
+        if i1 - i0 < 4:
+            return []
+        band = dbv[i0:i1]
+        band_med = float(np.median(band))
+        band_max = float(np.max(band))
+        thresh = max(band_med + 14.0, band_max - 40.0, -90.0)
+        mid = dbv[i0 + 1 : i1 - 1]
+        is_max = (mid > dbv[i0 : i1 - 2]) & (mid >= dbv[i0 + 2 : i1]) & (mid > thresh)
+        cand = np.nonzero(is_max)[0] + (i0 + 1)
+        if cand.size == 0:
+            return []
+        order = np.argsort(dbv[cand])[::-1]
+        min_sep = max(3, min(16, (i1 - i0) // 80))
+        loc_hw = max(24, (i1 - i0) // 16)
+        selected: list[tuple[int, float, float]] = []
+        for idx in cand[order]:
+            i_int = int(idx)
+            if not all(abs(i_int - s[0]) >= min_sep for s in selected):
+                continue
+            lo_loc = max(i0, i_int - loc_hw)
+            hi_loc = min(i1, i_int + loc_hw + 1)
+            local_med = float(np.median(dbv[lo_loc:hi_loc]))
+            if float(dbv[i_int]) < local_med + 10.0:
+                continue
+            pf, pd = GpuFftEngine._interp_peak(freqs, dbv, i_int)
+            selected.append((i_int, pf, pd))
+            if len(selected) >= max_peaks:
+                break
+        return [(f, d) for _, f, d in selected]

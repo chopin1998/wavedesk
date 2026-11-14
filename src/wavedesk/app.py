@@ -1,6 +1,7 @@
 """WaveDesk: Next-Gen GPU-Accelerated AD3 Oscilloscope, Spectrum Analyzer & AWG Workbench."""
 from __future__ import annotations
 import argparse
+import json
 from pathlib import Path
 import sys
 import wave
@@ -23,7 +24,7 @@ from .driver import (
     WAVEFORM_FUNCTIONS,
     select_optimal_sample_rate,
 )
-from .gpu_fft import WINDOWS
+from .gpu_fft import WINDOWS, GpuFftEngine
 from .gpu_view import GpuWaveformCurve
 from .measurements import format_si
 from .worker import InstrumentWorker
@@ -334,12 +335,18 @@ FFT_SPANS = [
 ]
 
 VOLTAGE_RANGES = [
-    ("±0.5 V (100 mV/div)", 1.0),
-    ("±1.0 V (200 mV/div)", 2.0),
-    ("±2.5 V (500 mV/div)", 5.0),
-    ("±5.0 V (1 V/div)", 10.0),
-    ("±10 V (2 V/div)", 20.0),
-    ("±25 V (5 V/div)", 50.0),
+    ("±5 mV (1 mV/div · 软件100x)", (1.0, 0.01)),
+    ("±10 mV (2 mV/div · 软件50x)", (1.0, 0.02)),
+    ("±25 mV (5 mV/div · 软件20x)", (1.0, 0.05)),
+    ("±50 mV (10 mV/div · 软件10x)", (1.0, 0.1)),
+    ("±0.1 V (20 mV/div · 软件5x)", (1.0, 0.2)),
+    ("±0.25 V (50 mV/div · 软件2x)", (1.0, 0.5)),
+    ("±0.5 V (100 mV/div)", (1.0, 1.0)),
+    ("±1.0 V (200 mV/div)", (2.0, 2.0)),
+    ("±2.5 V (500 mV/div)", (5.0, 5.0)),
+    ("±5.0 V (1 V/div)", (10.0, 10.0)),
+    ("±10 V (2 V/div)", (20.0, 20.0)),
+    ("±25 V (5 V/div)", (50.0, 50.0)),
 ]
 
 CHANNEL_FILTERS = [
@@ -845,7 +852,9 @@ class WaterfallOverlay(W.QFrame):
             ax = self.plot.getPlotItem().getAxis(ax_name)
             ax.setStyle(tickFont=tick_font)
         self.plot.getPlotItem().setLabel("left", None)
-        self.plot.getPlotItem().setLabel("bottom", None)
+        self.plot.getPlotItem().setLabel("bottom", "", units="Hz", color="#8b9bb0")
+        self.plot.getPlotItem().getAxis("bottom").enableAutoSIPrefix(True)
+        self.plot.getViewBox().setMouseEnabled(x=False, y=False)
         self.img = pg.ImageItem(axisOrder="row-major")
         # Dark -> Blue -> Cyan -> Yellow -> Red colormap
         pos = np.array([0.0, 0.25, 0.55, 0.80, 1.0])
@@ -878,6 +887,10 @@ class WaterfallOverlay(W.QFrame):
     def clear(self):
         self._buf.fill(-95.0)
         self.img.setImage(self._buf, autoLevels=False, levels=(-95.0, -5.0))
+
+    def sync_x_range(self, fx0: float, fx1: float):
+        if fx1 > fx0:
+            self.plot.setXRange(fx0, fx1, padding=0.0)
 
     def push_spectrum(self, freqs: np.ndarray, dbv: np.ndarray, fx0: float, fx1: float):
         if not self.isVisible() or freqs.size < 2 or fx1 <= fx0:
@@ -918,6 +931,230 @@ class WaterfallOverlay(W.QFrame):
         super().mouseReleaseEvent(ev)
 
 
+class InputInteractionFilter(QtCore.QObject):
+    """Global UX filter:
+    1) Disable mouse-wheel changes on all QComboBox widgets (forward scroll to parent QScrollArea).
+    2) On QSpinBox / QDoubleSpinBox, ignore wheel unless focused; when focused, step only the digit
+       immediately before the text cursor while preserving that digit's decimal-place cursor position.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._forwarding = False
+
+    @staticmethod
+    def _forward_to_scroll_area(obj: QtCore.QObject, ev: QtGui.QWheelEvent) -> bool:
+        p = obj.parent() if isinstance(obj, QtCore.QObject) else None
+        while isinstance(p, W.QWidget):
+            if isinstance(p, W.QAbstractScrollArea):
+                vp = p.viewport()
+                if vp is not None:
+                    QtCore.QCoreApplication.sendEvent(vp, ev)
+                    return True
+            p = p.parentWidget()
+        return False
+
+    @staticmethod
+    def step_spinbox_digit_at_cursor(spin: W.QAbstractSpinBox, steps: int) -> bool:
+        le = spin.lineEdit()
+        if le is None:
+            return False
+        text = le.text()
+        cur = le.cursorPosition()
+        prefix = spin.prefix()
+        suffix = spin.suffix()
+        num_start = len(prefix) if prefix and text.startswith(prefix) else 0
+        num_end = len(text) - len(suffix) if suffix and text.endswith(suffix) else len(text)
+        idx = cur - 1
+        if not (num_start <= idx < num_end) or not text[idx].isdigit():
+            return False
+
+        num_str = text[num_start:num_end]
+        rel_idx = idx - num_start
+        dot_pos = num_str.find(".")
+        if dot_pos >= 0:
+            power = (dot_pos - 1 - rel_idx) if rel_idx < dot_pos else (dot_pos - rel_idx)
+        else:
+            power = (len(num_str) - 1) - rel_idx
+
+        dist_from_end = num_end - cur
+        if isinstance(spin, W.QDoubleSpinBox):
+            step_val = 10.0 ** power
+            new_val = round(spin.value() + steps * step_val, spin.decimals())
+            new_val = max(spin.minimum(), min(spin.maximum(), new_val))
+            spin.setValue(new_val)
+        elif isinstance(spin, W.QSpinBox):
+            step_val = int(round(10 ** max(0, power)))
+            new_val = int(spin.value() + steps * step_val)
+            new_val = max(spin.minimum(), min(spin.maximum(), new_val))
+            spin.setValue(new_val)
+        else:
+            return False
+
+        new_text = le.text()
+        new_num_start = len(prefix) if prefix and new_text.startswith(prefix) else 0
+        new_num_end = len(new_text) - len(suffix) if suffix and new_text.endswith(suffix) else len(new_text)
+        new_cur = max(new_num_start, min(new_num_end, new_num_end - dist_from_end))
+        le.setCursorPosition(new_cur)
+        return True
+
+    def eventFilter(self, obj: QtCore.QObject, ev: QtCore.QEvent) -> bool:
+        if ev.type() != QtCore.QEvent.Type.Wheel or self._forwarding:
+            return False
+
+        if isinstance(obj, W.QComboBox):
+            self._forwarding = True
+            try:
+                self._forward_to_scroll_area(obj, ev)
+            finally:
+                self._forwarding = False
+            return True
+
+        spin: W.QAbstractSpinBox | None = None
+        if isinstance(obj, (W.QDoubleSpinBox, W.QSpinBox)):
+            spin = obj
+        elif isinstance(obj, W.QLineEdit) and isinstance(obj.parentWidget(), (W.QDoubleSpinBox, W.QSpinBox)):
+            spin = obj.parentWidget()
+
+        if spin is not None:
+            le = spin.lineEdit()
+            focused = spin.hasFocus() or (le is not None and le.hasFocus())
+            if not focused:
+                self._forwarding = True
+                try:
+                    self._forward_to_scroll_area(spin, ev)
+                finally:
+                    self._forwarding = False
+                return True
+
+            dy = ev.angleDelta().y()
+            if dy == 0:
+                dy = ev.pixelDelta().y()
+            if dy != 0:
+                self.step_spinbox_digit_at_cursor(spin, 1 if dy > 0 else -1)
+            return True
+
+        return False
+
+
+class PolynomialWaveformDialog(W.QDialog):
+    """Editor for multi-sine polynomial waveform: y(t) = sum_i A_i * sin(2*pi*f_i*t + phi_i)."""
+
+    def __init__(self, ch_idx: int, terms: list[tuple[float, float, float]], base_freq_hz: float, parent=None):
+        super().__init__(parent)
+        self._base_freq_hz = max(100.0, float(base_freq_hz))
+        self.setWindowTitle(f"W{ch_idx + 1} 多项式波形 (多正弦叠加编辑器)")
+        self.resize(620, 380)
+
+        vbox = W.QVBoxLayout(self)
+        vbox.setSpacing(8)
+
+        lbl = W.QLabel("y(t) = Σ Aᵢ · sin(2π fᵢ t + φᵢ)   (输出自动归一化到设定 Vpk 幅值)")
+        lbl.setObjectName("secTitle")
+        vbox.addWidget(lbl)
+
+        self.table = W.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["频率 (fᵢ)", "幅值权重 (Aᵢ)", "相位 (φᵢ °)", "删除"])
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, W.QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, W.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, W.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, W.QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(3, 52)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        vbox.addWidget(self.table, 1)
+
+        btn_bar = W.QHBoxLayout()
+        btn_add = W.QPushButton("+ 添加正弦项")
+        btn_add.clicked.connect(lambda: self._add_row(self._next_default_freq(), 1.0, 0.0))
+        btn_two = W.QPushButton("双音示例")
+        btn_two.clicked.connect(self._preset_two_tone)
+        btn_odd = W.QPushButton("奇次谐波 (方波逼近)")
+        btn_odd.clicked.connect(self._preset_odd_harmonics)
+        btn_bar.addWidget(btn_add)
+        btn_bar.addWidget(btn_two)
+        btn_bar.addWidget(btn_odd)
+        btn_bar.addStretch(1)
+        vbox.addLayout(btn_bar)
+
+        dlg_btns = W.QDialogButtonBox(
+            W.QDialogButtonBox.StandardButton.Ok | W.QDialogButtonBox.StandardButton.Cancel
+        )
+        dlg_btns.button(W.QDialogButtonBox.StandardButton.Ok).setText("应用")
+        dlg_btns.button(W.QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        dlg_btns.accepted.connect(self.accept)
+        dlg_btns.rejected.connect(self.reject)
+        vbox.addWidget(dlg_btns)
+
+        init_terms = terms if terms else [(self._base_freq_hz, 1.0, 0.0), (self._base_freq_hz * 1.2, 0.5, 0.0)]
+        for f, a, ph in init_terms:
+            self._add_row(f, a, ph)
+
+    def _next_default_freq(self) -> float:
+        cur = self.get_terms()
+        if not cur:
+            return self._base_freq_hz
+        return min(25_000_000.0, cur[-1][0] + self._base_freq_hz)
+
+    def _add_row(self, freq_hz: float, amp_w: float, phase_deg: float):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        f_in = FreqUnitInput(min_hz=1.0, max_hz=25_000_000.0, default_hz=float(freq_hz), allow_full=False)
+        spn_a = W.QDoubleSpinBox()
+        spn_a.setKeyboardTracking(False)
+        spn_a.setRange(-100.0, 100.0)
+        spn_a.setDecimals(3)
+        spn_a.setSingleStep(0.1)
+        spn_a.setValue(float(amp_w))
+
+        spn_ph = W.QDoubleSpinBox()
+        spn_ph.setKeyboardTracking(False)
+        spn_ph.setRange(-360.0, 360.0)
+        spn_ph.setDecimals(1)
+        spn_ph.setSingleStep(15.0)
+        spn_ph.setSuffix(" °")
+        spn_ph.setValue(float(phase_deg))
+
+        btn_del = W.QPushButton("✕")
+        btn_del.setObjectName("removeBtn")
+        btn_del.clicked.connect(lambda _, b=btn_del: self._remove_row_for_button(b))
+
+        self.table.setCellWidget(row, 0, f_in)
+        self.table.setCellWidget(row, 1, spn_a)
+        self.table.setCellWidget(row, 2, spn_ph)
+        self.table.setCellWidget(row, 3, btn_del)
+
+    def _remove_row_for_button(self, btn: W.QPushButton):
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, 3) is btn:
+                if self.table.rowCount() > 1:
+                    self.table.removeRow(r)
+                break
+
+    def _preset_two_tone(self):
+        self.table.setRowCount(0)
+        self._add_row(self._base_freq_hz, 1.0, 0.0)
+        self._add_row(min(25_000_000.0, self._base_freq_hz * 1.1), 1.0, 0.0)
+
+    def _preset_odd_harmonics(self):
+        self.table.setRowCount(0)
+        for k in (1, 3, 5, 7):
+            f_k = self._base_freq_hz * k
+            if f_k <= 25_000_000.0:
+                self._add_row(f_k, round(1.0 / k, 4), 0.0)
+
+    def get_terms(self) -> list[tuple[float, float, float]]:
+        terms: list[tuple[float, float, float]] = []
+        for r in range(self.table.rowCount()):
+            f_in = self.table.cellWidget(r, 0)
+            spn_a = self.table.cellWidget(r, 1)
+            spn_ph = self.table.cellWidget(r, 2)
+            if isinstance(f_in, FreqUnitInput) and isinstance(spn_a, W.QDoubleSpinBox) and isinstance(spn_ph, W.QDoubleSpinBox):
+                terms.append((float(f_in.value()), float(spn_a.value()), float(spn_ph.value())))
+        return terms
+
+
 class MainWindow(W.QMainWindow):
     req_connect = QtCore.Signal()
     req_disconnect = QtCore.Signal()
@@ -930,6 +1167,7 @@ class MainWindow(W.QMainWindow):
     req_pc_trig = QtCore.Signal()
     req_force_scope_trig = QtCore.Signal()
     req_fft_cfg = QtCore.Signal(dict)
+    req_power_cfg = QtCore.Signal(bool, float, float)
 
     def __init__(self, args: argparse.Namespace):
         super().__init__()
@@ -962,6 +1200,10 @@ class MainWindow(W.QMainWindow):
         self._active_awg_channels: set[int] = set()
         self._last_frame_data: dict | None = None
         self._peak_labels: list[pg.TextItem] = []
+
+        self._input_filter = InputInteractionFilter(self)
+        if (qapp := W.QApplication.instance()) is not None:
+            qapp.installEventFilter(self._input_filter)
 
         self._build_ui()
         self._load_settings()
@@ -1073,7 +1315,7 @@ class MainWindow(W.QMainWindow):
             maxXRange=0.1,
             yMin=-25.0,
             yMax=25.0,
-            minYRange=0.2,
+            minYRange=0.002,
             maxYRange=50.0,
         )
         self.scope_plot = FastPlotWidget(
@@ -1137,6 +1379,7 @@ class MainWindow(W.QMainWindow):
 
         # 2. Frequency-Domain GPU FFT Spectrum Plot
         self.fft_vb = FftViewBox()
+        self.fft_vb.sigXRangeChanged.connect(self._on_fft_xrange_changed)
         self.fft_plot = FastPlotWidget(
             "Frequency Domain · GPU 实时频谱分析仪 (Cooley-Tukey Radix-2 OpenCL/CUDA)",
             "Frequency",
@@ -1480,6 +1723,35 @@ class MainWindow(W.QMainWindow):
     def _build_misc_card(self) -> CollapsibleCard:
         card = CollapsibleCard("🛠 显示与系统杂项 (System / Misc)", expanded=False)
 
+        pwr_row = W.QHBoxLayout()
+        pwr_row.setSpacing(6)
+        self.chk_pwr = W.QCheckBox("⚡ V+/V- 供电")
+        self.chk_pwr.setChecked(False)
+        self.chk_pwr.setToolTip("开启/关闭 AD3 硬件 V+ / V- 直流电源引脚 (为外部混频器/有源模块供电)")
+        self.chk_pwr.toggled.connect(self._emit_power_config)
+        self.spn_vpos = W.QDoubleSpinBox()
+        self.spn_vpos.setKeyboardTracking(False)
+        self.spn_vpos.setRange(0.5, 5.0)
+        self.spn_vpos.setDecimals(2)
+        self.spn_vpos.setSingleStep(0.1)
+        self.spn_vpos.setValue(5.0)
+        self.spn_vpos.setPrefix("V+ ")
+        self.spn_vpos.setSuffix(" V")
+        self.spn_vpos.valueChanged.connect(self._emit_power_config)
+        self.spn_vneg = W.QDoubleSpinBox()
+        self.spn_vneg.setKeyboardTracking(False)
+        self.spn_vneg.setRange(-5.0, -0.5)
+        self.spn_vneg.setDecimals(2)
+        self.spn_vneg.setSingleStep(0.1)
+        self.spn_vneg.setValue(-5.0)
+        self.spn_vneg.setPrefix("V- ")
+        self.spn_vneg.setSuffix(" V")
+        self.spn_vneg.valueChanged.connect(self._emit_power_config)
+        pwr_row.addWidget(self.chk_pwr)
+        pwr_row.addWidget(self.spn_vpos, 1)
+        pwr_row.addWidget(self.spn_vneg, 1)
+        card.body_layout.addLayout(pwr_row)
+
         row = W.QHBoxLayout()
         row.setSpacing(8)
         self.chk_dpo = W.QCheckBox("DPO 余晖")
@@ -1497,6 +1769,13 @@ class MainWindow(W.QMainWindow):
         row.addWidget(self.btn_reconnect)
         card.body_layout.addLayout(row)
         return card
+
+    def _emit_power_config(self, *_):
+        self.req_power_cfg.emit(
+            self.chk_pwr.isChecked(),
+            float(self.spn_vpos.value()),
+            float(self.spn_vneg.value()),
+        )
 
     def _build_channels_card(self) -> CollapsibleCard:
         card = CollapsibleCard("📈 示波器通道 (CH1 / CH2)", expanded=True)
@@ -1533,7 +1812,7 @@ class MainWindow(W.QMainWindow):
             cmb_range = _compact_combo(W.QComboBox(), 10)
             for lbl, val in VOLTAGE_RANGES:
                 cmb_range.addItem(lbl, val)
-            cmb_range.setCurrentIndex(1 if idx == 0 else 2)
+            cmb_range.setCurrentIndex(7 if idx == 0 else 8)
             cmb_range.currentIndexChanged.connect(self._on_channel_range_changed)
             hdr.addWidget(cmb_range, 1)
 
@@ -1722,6 +2001,7 @@ class MainWindow(W.QMainWindow):
         self.awg_widgets = []
         self.awg_adv_widgets = []
         self.awg_custom_samples: list[list[float] | None] = [None, None]
+        self.awg_poly_terms: list[list[tuple[float, float, float]] | None] = [None, None]
         self.awg_am_wav: list[tuple[list[float], float, str] | None] = [None, None]
         self.awg_fm_wav: list[tuple[list[float], float, str] | None] = [None, None]
         self.awg_subcards: list[W.QFrame] = []
@@ -1763,14 +2043,16 @@ class MainWindow(W.QMainWindow):
             btn_load_custom.setToolTip("从 CSV/TXT/NPY 加载自定义任意波形 (归一化到 [-1, 1])")
             btn_load_custom.setVisible(False)
             btn_load_custom.clicked.connect(lambda _, i=idx: self._load_custom_awg_waveform(i))
+            btn_edit_poly = W.QPushButton("∑ 编辑多项式")
+            btn_edit_poly.setToolTip("输入多个正弦项的频率、幅值和相位进行叠加")
+            btn_edit_poly.setVisible(False)
+            btn_edit_poly.clicked.connect(lambda _, i=idx: self._edit_poly_awg_waveform(i))
             cmb_fn.currentTextChanged.connect(
-                lambda txt, i=idx, b=btn_load_custom: (
-                    b.setVisible(txt == "Custom (自定义)"),
-                    self._emit_awg_config(i),
-                )
+                lambda txt, i=idx: self._on_awg_fn_changed(i, txt)
             )
             fn_row.addWidget(cmb_fn, 1)
             fn_row.addWidget(btn_load_custom)
+            fn_row.addWidget(btn_edit_poly)
             grid.addLayout(fn_row, 0, 1)
 
             grid.addWidget(W.QLabel("频率:"), 1, 0)
@@ -2000,6 +2282,53 @@ class MainWindow(W.QMainWindow):
             cmb_ssb.currentTextChanged.connect(lambda txt, i=idx: self._on_ssb_changed(i, txt))
             adv_grid.addWidget(cmb_ssb, 7, 1)
 
+            # Linear Frequency Sweep (Chirp)
+            chk_sweep = W.QCheckBox("线性扫频 (Chirp)")
+            chk_sweep.setToolTip("硬件线性调频扫频：从起始频率线性扫至结束频率，可设扫频周期、间隔和重复次数")
+            chk_sweep.toggled.connect(lambda _, i=idx: self._emit_awg_config(i))
+            adv_grid.addWidget(chk_sweep, 8, 0)
+            sw_freq_row = W.QHBoxLayout()
+            sw_freq_row.setSpacing(4)
+            freq_sweep_start = FreqUnitInput(min_hz=1.0, max_hz=25_000_000.0, default_hz=100_000.0, allow_full=False)
+            freq_sweep_start.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+            freq_sweep_stop = FreqUnitInput(min_hz=1.0, max_hz=25_000_000.0, default_hz=1_000_000.0, allow_full=False)
+            freq_sweep_stop.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+            sw_freq_row.addWidget(freq_sweep_start, 1)
+            sw_freq_row.addWidget(W.QLabel("→"))
+            sw_freq_row.addWidget(freq_sweep_stop, 1)
+            adv_grid.addLayout(sw_freq_row, 8, 1)
+
+            adv_grid.addWidget(W.QLabel("周期 / 间隔 / 次数:"), 9, 0)
+            sw_time_row = W.QHBoxLayout()
+            sw_time_row.setSpacing(4)
+            spn_sweep_ms = W.QDoubleSpinBox()
+            spn_sweep_ms.setKeyboardTracking(False)
+            spn_sweep_ms.setRange(0.05, 100_000.0)
+            spn_sweep_ms.setDecimals(2)
+            spn_sweep_ms.setValue(10.0)
+            spn_sweep_ms.setSuffix(" ms周期")
+            spn_sweep_ms.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+
+            spn_sweep_wait_ms = W.QDoubleSpinBox()
+            spn_sweep_wait_ms.setKeyboardTracking(False)
+            spn_sweep_wait_ms.setRange(0.0, 100_000.0)
+            spn_sweep_wait_ms.setDecimals(2)
+            spn_sweep_wait_ms.setValue(0.0)
+            spn_sweep_wait_ms.setSuffix(" ms间隔")
+            spn_sweep_wait_ms.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+
+            spn_sweep_rep = W.QSpinBox()
+            spn_sweep_rep.setKeyboardTracking(False)
+            spn_sweep_rep.setRange(0, 1_000_000)
+            spn_sweep_rep.setValue(0)
+            spn_sweep_rep.setSpecialValueText("无限 (0)")
+            spn_sweep_rep.setSuffix(" 次")
+            spn_sweep_rep.valueChanged.connect(lambda _, i=idx: self._emit_awg_config(i))
+            sw_time_row.addWidget(spn_sweep_ms, 1)
+            sw_time_row.addWidget(spn_sweep_wait_ms, 1)
+            sw_time_row.addWidget(spn_sweep_rep, 1)
+            adv_grid.addLayout(sw_time_row, 9, 1)
+
             p_layout.addWidget(adv_box)
             sub.setVisible(idx in self._active_awg_channels)
             card.body_layout.addWidget(sub)
@@ -2027,7 +2356,14 @@ class MainWindow(W.QMainWindow):
                 "spn_limit_v": spn_limit_v,
                 "chk_sync_w1": chk_sync_w1,
                 "btn_load_custom": btn_load_custom,
+                "btn_edit_poly": btn_edit_poly,
                 "cmb_ssb": cmb_ssb,
+                "chk_sweep": chk_sweep,
+                "freq_sweep_start": freq_sweep_start,
+                "freq_sweep_stop": freq_sweep_stop,
+                "spn_sweep_ms": spn_sweep_ms,
+                "spn_sweep_wait_ms": spn_sweep_wait_ms,
+                "spn_sweep_rep": spn_sweep_rep,
                 "btn_adv": btn_adv,
                 "adv_box": adv_box,
             })
@@ -2051,6 +2387,7 @@ class MainWindow(W.QMainWindow):
         self.req_pc_trig.connect(self.worker.trigger_pc)
         self.req_force_scope_trig.connect(self.worker.force_scope_trigger)
         self.req_fft_cfg.connect(self.worker.update_fft_settings)
+        self.req_power_cfg.connect(self.worker.update_power_supply)
 
         self.worker.connected.connect(self._on_device_connected)
         self.worker.status_changed.connect(self.lbl_status.setText)
@@ -2074,7 +2411,9 @@ class MainWindow(W.QMainWindow):
                 for code, label in backends:
                     self.cmb_fft_backend.addItem(label, code)
 
-        # Apply initial scope and FFT settings (keep AWG output disabled on startup unless user enables it)
+        # Apply initial scope and FFT settings
+        if self.chk_pwr.isChecked():
+            self._emit_power_config()
         self._emit_scope_config()
         self._emit_fft_config()
 
@@ -2158,16 +2497,32 @@ class MainWindow(W.QMainWindow):
             b.setVisible(idx not in self._active_awg_channels)
         self.lbl_awg_empty.setVisible(len(self._active_awg_channels) == 0)
 
+    @staticmethod
+    def _unpack_voltage_range(data) -> tuple[float, float]:
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            return float(data[0]), float(data[1])
+        val = float(data or 2.0)
+        return val, val
+
     def _apply_vertical_view(self):
-        # Match oscilloscope vertical window to the active primary channel range, attenuation & offset
+        # Match oscilloscope vertical window to the active primary channel display span, attenuation & offset.
+        # During software zoom (disp_span < hw_range_v), scale around 0 V so the 0-V baseline never shifts on screen.
         for idx in sorted(self._active_scope_channels):
             cmb_range, _, _, spn_offset, cmb_atten, _ = self.ch_controls[idx]
-            vpp_range = float(cmb_range.currentData() or 2.0)
+            hw_range_v, disp_span = self._unpack_voltage_range(cmb_range.currentData())
             atten = float(cmb_atten.currentData() or 1.0)
             offset_v = float(spn_offset.value())
-            half = 0.5 * vpp_range * atten
-            self.scope_plot.setYRange(offset_v - half, offset_v + half, padding=0.04)
+            hw_half = 0.5 * hw_range_v * atten
+            sw_scale = disp_span / max(hw_range_v, 1e-9)
+            y0 = (offset_v - hw_half) * sw_scale
+            y1 = (offset_v + hw_half) * sw_scale
+            self.scope_plot.setYRange(y0, y1, padding=0.0)
             break
+
+    def _on_fft_xrange_changed(self, *_):
+        if hasattr(self, "waterfall_overlay") and self.waterfall_overlay.isVisible():
+            fx_r, _ = self.fft_vb.viewRange()
+            self.waterfall_overlay.sync_x_range(float(fx_r[0]), float(fx_r[1]))
 
     def _on_trig_line_dragged(self):
         val = float(self.trig_line.value())
@@ -2219,13 +2574,18 @@ class MainWindow(W.QMainWindow):
         fs = select_optimal_sample_rate(tb, buffer_size=buf) if auto_sr else rate_sel
 
         ch_cfgs = []
+        primary_disp_span = 2.0
         for idx, (cmb_range, chk_ac, cmb_flt, spn_offset, cmb_atten, cmb_hw_flt) in enumerate(self.ch_controls):
             flt_val = cmb_flt.currentData() or (0.0, False)
             lpf_hz, show_env = float(flt_val[0]), bool(flt_val[1])
+            hw_range_v, disp_span = self._unpack_voltage_range(cmb_range.currentData())
+            enabled = idx in self._active_scope_channels
+            if enabled and idx == min(self._active_scope_channels):
+                primary_disp_span = disp_span * float(cmb_atten.currentData() or 1.0)
             ch_cfgs.append(
                 ChannelConfig(
-                    enabled=(idx in self._active_scope_channels),
-                    range_v=float(cmb_range.currentData() or 2.0),
+                    enabled=enabled,
+                    range_v=hw_range_v,
                     offset_v=float(spn_offset.value()),
                     coupling_ac=chk_ac.isChecked(),
                     attenuation=float(cmb_atten.currentData() or 1.0),
@@ -2234,6 +2594,10 @@ class MainWindow(W.QMainWindow):
                     show_envelope=show_env,
                 )
             )
+        user_hyst = float(self.spn_trig_hyst.value())
+        eff_hyst = min(user_hyst, max(0.0005, 0.01 * primary_disp_span)) if primary_disp_span <= 1.0 else user_hyst
+        self.spn_trig_lvl.setDecimals(3 if primary_disp_span < 0.5 else 2)
+        self.spn_trig_lvl.setSingleStep(max(0.001, round(primary_disp_span * 0.02, 4)))
         trig = TriggerConfig(
             mode=self.cmb_trig_mode.currentText(),
             source=self.cmb_trig_src.currentText(),
@@ -2245,7 +2609,7 @@ class MainWindow(W.QMainWindow):
             trig_type=self.cmb_trig_type.currentText(),
             length_s=float(self.spn_trig_len_us.value()) * 1e-6,
             length_cond=self.cmb_trig_len_cond.currentText(),
-            hysteresis_v=float(self.spn_trig_hyst.value()),
+            hysteresis_v=eff_hyst,
             hw_filter=self.cmb_trig_hw_flt.currentText(),
         )
         self.scope_cfg = ScopeConfig(
@@ -2274,6 +2638,29 @@ class MainWindow(W.QMainWindow):
             size="11pt",
         )
         self.req_scope_cfg.emit(self.scope_cfg)
+
+    def _on_awg_fn_changed(self, idx: int, txt: str):
+        adv = self.awg_adv_widgets[idx]
+        adv["btn_load_custom"].setVisible(txt == "Custom (自定义)")
+        is_poly = txt == "Polynomial (多正弦)"
+        adv["btn_edit_poly"].setVisible(is_poly)
+        if is_poly and not self.awg_poly_terms[idx]:
+            base_f = float(self.awg_widgets[idx][2].value())
+            self.awg_poly_terms[idx] = [(base_f, 1.0, 0.0), (min(25_000_000.0, base_f * 1.2), 0.5, 0.0)]
+            self._edit_poly_awg_waveform(idx)
+        else:
+            self._emit_awg_config(idx)
+
+    def _edit_poly_awg_waveform(self, idx: int):
+        base_f = float(self.awg_widgets[idx][2].value())
+        cur_terms = self.awg_poly_terms[idx] or [(base_f, 1.0, 0.0), (min(25_000_000.0, base_f * 1.2), 0.5, 0.0)]
+        dlg = PolynomialWaveformDialog(idx, cur_terms, base_f, parent=self)
+        if dlg.exec() == W.QDialog.DialogCode.Accepted:
+            terms = dlg.get_terms()
+            if terms:
+                self.awg_poly_terms[idx] = terms
+                self.lbl_status.setText(f"W{idx + 1} 多项式波形已更新 ({len(terms)} 个正弦项)")
+                self._emit_awg_config(idx)
 
     def _load_custom_awg_waveform(self, idx: int):
         path, _ = W.QFileDialog.getOpenFileName(
@@ -2396,6 +2783,7 @@ class MainWindow(W.QMainWindow):
             symmetry_pct=float(spn_sym.value()),
             phase_deg=float(adv["phase"].value()),
             custom_samples=self.awg_custom_samples[idx],
+            poly_terms=self.awg_poly_terms[idx],
             am_enabled=adv["chk_am"].isChecked(),
             am_function=adv["cmb_am_fn"].currentText(),
             am_frequency_hz=float(adv["freq_am"].value()),
@@ -2409,6 +2797,12 @@ class MainWindow(W.QMainWindow):
             fm_wav_samples=fm_wav[0] if fm_wav else None,
             fm_wav_rate_hz=fm_wav[1] if fm_wav else 16_000.0,
             ssb_mode=adv["cmb_ssb"].currentText(),
+            sweep_enabled=adv["chk_sweep"].isChecked(),
+            sweep_start_hz=float(adv["freq_sweep_start"].value()),
+            sweep_stop_hz=float(adv["freq_sweep_stop"].value()),
+            sweep_time_s=float(adv["spn_sweep_ms"].value()) * 1e-3,
+            sweep_wait_s=float(adv["spn_sweep_wait_ms"].value()) * 1e-3,
+            sweep_repeat=int(adv["spn_sweep_rep"].value()),
             run_s=float(adv["spn_run_ms"].value()) * 1e-3,
             wait_s=float(adv["spn_wait_ms"].value()) * 1e-3,
             repeat_count=int(adv["spn_repeat"].value()),
@@ -2445,6 +2839,8 @@ class MainWindow(W.QMainWindow):
                 self.waterfall_overlay.move(x, y)
             self.waterfall_overlay.show()
             self.waterfall_overlay.raise_()
+            fx_r, _ = self.fft_vb.viewRange()
+            self.waterfall_overlay.sync_x_range(float(fx_r[0]), float(fx_r[1]))
         else:
             self.waterfall_overlay.hide()
 
@@ -2509,27 +2905,39 @@ class MainWindow(W.QMainWindow):
         meas = self._last_frame_data.get("meas", {})
         m1 = meas.get("ch1", {})
         m2 = meas.get("ch2", {})
-        primary_m = m1 if self.scope_cfg.channels[0].enabled and m1 else m2
+        use_ch1 = self.scope_cfg.channels[0].enabled and bool(m1)
+        primary_m = m1 if use_ch1 else m2
         if not primary_m:
             self.autoscale_views()
             return
 
-        # Prefer IF envelope frequency (e.g. 100 kHz) when present so user sees clean mixer IF periods
+        # Prefer IF envelope frequency, then time-domain freq, then hardware counter, then FFT fundamental peak
         target_f = primary_m.get("if_freq_hz", 0.0) or primary_m.get("freq_hz", 0.0)
+        if target_f <= 10.0:
+            target_f = float(self._last_frame_data.get("hw_freq_hz") or 0.0)
+        if target_f <= 10.0:
+            fft_dict = self._last_frame_data.get("fft", {})
+            ch_fft = fft_dict.get("ch1" if use_ch1 else "ch2") or fft_dict.get("ch1") or fft_dict.get("ch2")
+            if ch_fft:
+                target_f = float(ch_fft.get("metrics", {}).get("fund_freq", 0.0) or 0.0)
+
         if target_f > 10.0:
             ideal_tb = (4.0 / target_f) / 10.0  # 4 periods across 10 divisions
             best_idx = min(range(len(TIMEBASES)), key=lambda i: abs(np.log10(TIMEBASES[i][1] / ideal_tb)))
             self.cmb_timebase.setCurrentIndex(best_idx)
 
         vpp = primary_m.get("vpp", 1.0)
-        if vpp > 0.01:
-            needed_range = max(1.0, vpp * 1.35)
-            ch_idx = 0 if (self.scope_cfg.channels[0].enabled and m1) else 1
+        if vpp > 0.001:
+            needed_span = max(0.01, vpp * 1.35)
+            ch_idx = 0 if use_ch1 else 1
             cmb_range = self.ch_controls[ch_idx][0]
-            for i, (_, r_val) in enumerate(VOLTAGE_RANGES):
-                if r_val >= needed_range:
-                    cmb_range.setCurrentIndex(i)
+            matched_idx = len(VOLTAGE_RANGES) - 1
+            for i, (_, r_data) in enumerate(VOLTAGE_RANGES):
+                _, disp_span = self._unpack_voltage_range(r_data)
+                if disp_span >= needed_span:
+                    matched_idx = i
                     break
+            cmb_range.setCurrentIndex(matched_idx)
         self._apply_timebase_view()
         self._apply_vertical_view()
 
@@ -2541,7 +2949,7 @@ class MainWindow(W.QMainWindow):
             primary_fft = fft_dict.get("ch1") or fft_dict.get("ch2")
             if primary_fft:
                 self._update_fft_x_range(primary_fft)
-        self.fft_plot.setYRange(-105.0, 10.0)
+        self._on_fft_unit_changed()
 
     def _update_fft_x_range(self, primary_fft: dict, saved_xrange: tuple[float, float] | None = None):
         freqs = primary_fft["freqs"]
@@ -2633,6 +3041,23 @@ class MainWindow(W.QMainWindow):
             self.fft_curve_ch2.set_fast_data(f2["freqs"], self._fft_convert_mag(f2["dbv"]))
             fft_ms += f2.get("compute_ms", 0.0)
 
+        primary_fft = f1 or f2
+        if primary_fft:
+            if not getattr(self, "_fft_x_initialized", False):
+                self._fft_x_initialized = True
+                saved_xr = getattr(self, "_saved_fft_xrange", None)
+                self._saved_fft_xrange = None
+                self._update_fft_x_range(primary_fft, saved_xrange=saved_xr)
+
+            if self.waterfall_overlay.isVisible():
+                fx_r, _ = self.fft_plot.getViewBox().viewRange()
+                self.waterfall_overlay.push_spectrum(
+                    primary_fft["freqs"],
+                    primary_fft["dbv"],
+                    float(fx_r[0]),
+                    float(fx_r[1]),
+                )
+
         if not telemetry_updated:
             return
 
@@ -2671,32 +3096,21 @@ class MainWindow(W.QMainWindow):
         else:
             self._set_label_if_changed(self.lbl_meas_ch2, "已禁用")
 
-        primary_fft = f1 or f2
         if primary_fft:
-            if not getattr(self, "_fft_x_initialized", False):
-                self._fft_x_initialized = True
-                saved_xr = getattr(self, "_saved_fft_xrange", None)
-                self._saved_fft_xrange = None
-                self._update_fft_x_range(primary_fft, saved_xrange=saved_xr)
-
-            if self.waterfall_overlay.isVisible():
-                fx_r, _ = self.fft_plot.getViewBox().viewRange()
-                self.waterfall_overlay.push_spectrum(
-                    primary_fft["freqs"],
-                    self._fft_convert_mag(primary_fft["dbv"]),
-                    float(fx_r[0]),
-                    float(fx_r[1]),
-                )
-
             met = primary_fft.get("metrics", {})
             if met:
                 peaks = met.get("peaks", [])
-                if peaks:
-                    # Prefer peaks inside the visible FFT X-range so off-screen peaks don't hide in-band sidebands
-                    fx_r, _ = self.fft_plot.getViewBox().viewRange()
-                    vis_peaks = [p for p in peaks if fx_r[0] <= p[0] <= fx_r[1]]
-                    if not vis_peaks:
-                        vis_peaks = peaks
+                fx_r, _ = self.fft_plot.getViewBox().viewRange()
+                vis_peaks = GpuFftEngine.find_peaks_in_band(
+                    primary_fft["freqs"],
+                    primary_fft["dbv"],
+                    float(fx_r[0]),
+                    float(fx_r[1]),
+                    max_peaks=8,
+                )
+                if not vis_peaks:
+                    vis_peaks = [p for p in peaks if fx_r[0] <= p[0] <= fx_r[1]] or peaks
+                if vis_peaks:
                     px = [p[0] for p in vis_peaks[:12]]
                     py_dbv = np.asarray([p[1] for p in vis_peaks[:12]], dtype=np.float32)
                     py = self._fft_convert_mag(py_dbv).tolist()
@@ -2739,9 +3153,11 @@ class MainWindow(W.QMainWindow):
                 )
             elif not self.chk_goertzel.isChecked():
                 self._set_label_if_changed(self.lbl_goertzel, "-- · -- °")
+            dev_name = primary_fft.get("device_name", "FFT")
+            n_pts = primary_fft.get("n_fft", len(primary_fft.get("freqs", ())))
             self._set_label_if_changed(
                 self.lbl_gpu_badge,
-                f"⚡ {primary_fft['device_name']} · {primary_fft['n_fft']} pts · {fft_ms:5.2f} ms",
+                f"⚡ {dev_name} · {n_pts} pts · {fft_ms:5.2f} ms",
             )
 
         fps = data.get("fps", 0.0)
@@ -2847,7 +3263,13 @@ class MainWindow(W.QMainWindow):
                     QtCore.QSignalBlocker(cmb_atten),
                     QtCore.QSignalBlocker(cmb_hw_flt),
                 ):
-                    cmb_range.setCurrentIndex(int(np.clip(s.value(f"ch{idx}/range_idx", 1 if idx == 0 else 2, type=int), 0, cmb_range.count() - 1)))
+                    default_span = 2.0 if idx == 0 else 5.0
+                    saved_span = s.value(f"ch{idx}/range_span", default_span, type=float)
+                    best_r_idx = min(
+                        range(cmb_range.count()),
+                        key=lambda i: abs(self._unpack_voltage_range(cmb_range.itemData(i))[1] - saved_span),
+                    )
+                    cmb_range.setCurrentIndex(best_r_idx)
                     chk_ac.setChecked(s.value(f"ch{idx}/ac", False, type=bool))
                     cmb_flt.setCurrentIndex(int(np.clip(s.value(f"ch{idx}/flt_idx", 0 if idx == 0 else 1, type=int), 0, cmb_flt.count() - 1)))
                     spn_offset.setValue(s.value(f"ch{idx}/offset_v", 0.0, type=float))
@@ -2909,6 +3331,15 @@ class MainWindow(W.QMainWindow):
                             "cmb_idle",
                             "spn_limit_v",
                             "chk_sync_w1",
+                            "cmb_ssb",
+                            "chk_sweep",
+                            "freq_sweep_start",
+                            "freq_sweep_stop",
+                            "spn_sweep_ms",
+                            "spn_sweep_wait_ms",
+                            "spn_sweep_rep",
+                            "cmb_am_wav",
+                            "cmb_fm_wav",
                         )
                     ]
                     try:
@@ -2931,6 +3362,12 @@ class MainWindow(W.QMainWindow):
                         adv["spn_limit_v"].setValue(s.value(f"awg{idx}/limit_v", 0.0, type=float))
                         adv["chk_sync_w1"].setChecked(s.value(f"awg{idx}/sync_w1", False, type=bool))
                         adv["cmb_ssb"].setCurrentText(s.value(f"awg{idx}/ssb_mode", "Off (关闭)", type=str))
+                        adv["chk_sweep"].setChecked(s.value(f"awg{idx}/sweep_en", False, type=bool))
+                        adv["freq_sweep_start"].setValue(s.value(f"awg{idx}/sweep_start", 100_000.0, type=float))
+                        adv["freq_sweep_stop"].setValue(s.value(f"awg{idx}/sweep_stop", 1_000_000.0, type=float))
+                        adv["spn_sweep_ms"].setValue(s.value(f"awg{idx}/sweep_ms", 10.0, type=float))
+                        adv["spn_sweep_wait_ms"].setValue(s.value(f"awg{idx}/sweep_wait_ms", 0.0, type=float))
+                        adv["spn_sweep_rep"].setValue(s.value(f"awg{idx}/sweep_rep", 0, type=int))
                         adv_open = s.value(f"awg{idx}/adv_open", False, type=bool)
                         adv["btn_adv"].setChecked(adv_open)
                         adv["adv_box"].setVisible(adv_open)
@@ -2942,6 +3379,19 @@ class MainWindow(W.QMainWindow):
                                 if widx >= 0:
                                     adv[f"cmb_{kind}_wav"].setCurrentIndex(widx)
                         adv["btn_load_custom"].setVisible(cmb_fn.currentText() == "Custom (自定义)")
+                        adv["btn_edit_poly"].setVisible(cmb_fn.currentText() == "Polynomial (多正弦)")
+                        poly_raw = s.value(f"awg{idx}/poly_terms", "", type=str)
+                        if poly_raw:
+                            try:
+                                parsed = json.loads(poly_raw)
+                                if isinstance(parsed, list):
+                                    self.awg_poly_terms[idx] = [
+                                        (float(t[0]), float(t[1]), float(t[2]))
+                                        for t in parsed
+                                        if isinstance(t, (list, tuple)) and len(t) == 3
+                                    ]
+                            except Exception:
+                                pass
                         for kind in ("am", "fm"):
                             is_wav = adv[f"cmb_{kind}_fn"].currentText() == "WAV (音频文件)"
                             adv[f"freq_{kind}"].setVisible(not is_wav)
@@ -3015,7 +3465,8 @@ class MainWindow(W.QMainWindow):
 
         s.setValue("scope/open_channels", [str(i) for i in sorted(self._active_scope_channels)])
         for idx, (cmb_range, chk_ac, cmb_flt, spn_offset, cmb_atten, cmb_hw_flt) in enumerate(self.ch_controls):
-            s.setValue(f"ch{idx}/range_idx", cmb_range.currentIndex())
+            _, disp_span = self._unpack_voltage_range(cmb_range.currentData())
+            s.setValue(f"ch{idx}/range_span", disp_span)
             s.setValue(f"ch{idx}/ac", chk_ac.isChecked())
             s.setValue(f"ch{idx}/flt_idx", cmb_flt.currentIndex())
             s.setValue(f"ch{idx}/offset_v", spn_offset.value())
@@ -3065,9 +3516,17 @@ class MainWindow(W.QMainWindow):
             s.setValue(f"awg{idx}/limit_v", adv["spn_limit_v"].value())
             s.setValue(f"awg{idx}/sync_w1", adv["chk_sync_w1"].isChecked())
             s.setValue(f"awg{idx}/ssb_mode", adv["cmb_ssb"].currentText())
+            s.setValue(f"awg{idx}/sweep_en", adv["chk_sweep"].isChecked())
+            s.setValue(f"awg{idx}/sweep_start", adv["freq_sweep_start"].value())
+            s.setValue(f"awg{idx}/sweep_stop", adv["freq_sweep_stop"].value())
+            s.setValue(f"awg{idx}/sweep_ms", adv["spn_sweep_ms"].value())
+            s.setValue(f"awg{idx}/sweep_wait_ms", adv["spn_sweep_wait_ms"].value())
+            s.setValue(f"awg{idx}/sweep_rep", adv["spn_sweep_rep"].value())
             s.setValue(f"awg{idx}/adv_open", adv["btn_adv"].isChecked())
             s.setValue(f"awg{idx}/am_wav", adv["cmb_am_wav"].currentText())
             s.setValue(f"awg{idx}/fm_wav", adv["cmb_fm_wav"].currentText())
+            if self.awg_poly_terms[idx] is not None:
+                s.setValue(f"awg{idx}/poly_terms", json.dumps(self.awg_poly_terms[idx]))
         s.setValue("waterfall/open", self.waterfall_overlay.isVisible())
         s.setValue("waterfall/x", self.waterfall_overlay.x())
         s.setValue("waterfall/y", self.waterfall_overlay.y())
